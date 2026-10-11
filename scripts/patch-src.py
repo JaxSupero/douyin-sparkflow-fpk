@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""对上游源码副本应用 fnOS 原生部署微补丁（严格锚点校验，缺失即失败）。
+
+补丁清单（全部为“环境变量开关 + 默认值不变”的最小侵入式改动）：
+
+1. webui/ops.py
+   - HOST_CRONTAB_PATH / CRON_LOG_PATH 支持环境变量覆盖；
+   - 新增 host_spool_enabled()，将“容器内才读写 spool”的判定扩展为
+     “容器内 或 显式指定了 spool 路径（fnOS 原生部署）”。
+2. utils/config.py
+   - DEFAULT_APP_SETTINGS.ops_log_file 支持 SPARKFLOW_OPS_LOG_FILE 覆盖。
+3. webui/login_lock.py
+   - 登录工作区锁文件目录支持 SPARKFLOW_STATE_DIR 覆盖（默认 /opt 不变）。
+
+用法：
+  patch-src.py <src_dir>          # 就地修改 <src_dir>（构建时对副本执行）
+  patch-src.py <src_dir> --check  # 只校验锚点是否匹配，不写入
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+
+def replace_once(text: str, old: str, new: str, *, file: str, expect: int = 1) -> str:
+    count = text.count(old)
+    if count != expect:
+        raise SystemExit(
+            f"[patch] FAIL {file}: 期望匹配 {expect} 处，实际 {count} 处；"
+            f"上游代码可能已变化，请更新 patch-src.py 的锚点。\n锚点片段:\n{old}"
+        )
+    return text.replace(old, new)
+
+
+PATCHES: dict[str, list[tuple[str, str, int]]] = {
+    "webui/ops.py": [
+        (
+            'HOST_CRONTAB_PATH = Path("/host-spool-cron/root")',
+            'HOST_CRONTAB_PATH = Path(os.getenv("SPARKFLOW_HOST_CRONTAB_PATH") or "/host-spool-cron/root")',
+            1,
+        ),
+        (
+            'def running_in_container():\n    return Path("/.dockerenv").exists()\n',
+            'def running_in_container():\n    return Path("/.dockerenv").exists()\n'
+            '\n'
+            '\n'
+            'def host_spool_enabled():\n'
+            '    """fnOS 原生部署（FPK）：显式配置了 spool 路径时启用宿主 spool 行为。"""\n'
+            '    return running_in_container() or bool(os.getenv("SPARKFLOW_HOST_CRONTAB_PATH"))\n',
+            1,
+        ),
+        (
+            "running_in_container() and HOST_CRONTAB_PATH",
+            "host_spool_enabled() and HOST_CRONTAB_PATH",
+            4,
+        ),
+        (
+            'CRON_LOG_PATH = "/app/logs/douyin-sparkflow.log"',
+            'CRON_LOG_PATH = os.getenv("SPARKFLOW_CRON_LOG_PATH") or "/app/logs/douyin-sparkflow.log"',
+            1,
+        ),
+    ],
+    "utils/config.py": [
+        (
+            '"ops_log_file": "/app/logs/douyin-sparkflow.log",',
+            '"ops_log_file": os.getenv("SPARKFLOW_OPS_LOG_FILE") or "/app/logs/douyin-sparkflow.log",',
+            1,
+        ),
+    ],
+    "webui/login_lock.py": [
+        (
+            '        Path("/opt/douyin-sparkflow/state"),',
+            '        Path(os.getenv("SPARKFLOW_STATE_DIR") or "/opt/douyin-sparkflow/state"),',
+            1,
+        ),
+    ],
+}
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("src_dir", type=Path)
+    ap.add_argument("--check", action="store_true", help="仅校验，不写入")
+    args = ap.parse_args()
+
+    total = 0
+    for rel, ops in PATCHES.items():
+        path = args.src_dir / rel
+        if not path.is_file():
+            raise SystemExit(f"[patch] FAIL: 缺少文件 {path}")
+        text = original = path.read_text(encoding="utf-8")
+        for old, new, expect in ops:
+            text = replace_once(text, old, new, file=rel, expect=expect)
+            total += expect
+        if text != original and not args.check:
+            path.write_text(text, encoding="utf-8")
+        print(f"[patch] OK {rel} ({len(ops)} 组替换)")
+    mode = "检查" if args.check else "应用"
+    print(f"[patch] {mode}完成，共 {total} 处替换。")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
