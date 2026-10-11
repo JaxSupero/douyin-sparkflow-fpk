@@ -102,7 +102,7 @@ echo "deps-version: $(cat "$DIST/deps/.deps-version")"
 
 # ─────────────────────────────────────────────────────────────
 log "3/7 Playwright Chromium（$PW_HOST）"
-PW_VER="$(awk -F= '/^playwright==/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' "$SRC_DIR/requirements.txt")"
+PW_VER="$(awk '/^playwright==/ {sub(/^playwright==/, ""); gsub(/[[:space:]]/, ""); print; exit}' "$SRC_DIR/requirements.txt")"
 [ -n "$PW_VER" ] || { echo "requirements.txt 未固定 playwright 版本" >&2; exit 1; }
 # 浏览器 revision 随 Playwright 版本变化，用版本号当缓存键
 CHROME_STAMP="$DIST/chrome/.playwright-version"
