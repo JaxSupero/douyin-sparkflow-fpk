@@ -117,17 +117,33 @@ log "4/6 权限规范化 + 软链接归一化"
 # "cp: -r not specified; omitting directory" 失败并返回非零，
 # 在 set -e 下直接终止构建（tzdata 的 posix/America -> ../America 就是这么炸的）。
 materialize_links() {
+  local app_abs="$PWD/app"
   find app -type l -print0 | while IFS= read -r -d '' link; do
     target="$(readlink -f "$link" 2>/dev/null || true)"
     if [ -z "$target" ] || [ ! -e "$target" ]; then
       echo "WARN: 移除悬空软链: $link"
       rm -f "$link"
-    elif [ -d "$target" ]; then
+      continue
+    fi
+    # 绝对路径软链会解析到构建宿主自身的目录（如 /etc/ssl/private、/usr/share/...），
+    # 这些引用不可能被忠实打包，而且直接 cp 还可能 Permission denied。
+    # 只有落在 app/ 树内的软链才是自包含的，才物化。
+    case "$target" in
+      "$app_abs"/*) ;;
+      *)
+        echo "WARN: 移除指向树外的软链: $link -> $(readlink "$link")"
+        rm -f "$link"
+        continue
+        ;;
+    esac
+    if [ -d "$target" ]; then
       rm -f "$link"
       mkdir -p "$link"
-      cp -aL "$target/." "$link/"
+      cp -aL "$target/." "$link/" 2>/dev/null \
+        || { echo "WARN: 目录软链物化失败，改为移除: $link"; rm -rf "$link"; }
     else
-      cp -Lp --remove-destination "$target" "$link"
+      cp -Lp --remove-destination "$target" "$link" 2>/dev/null \
+        || { echo "WARN: 文件软链物化失败，改为移除: $link"; rm -f "$link"; }
     fi
   done
 }
