@@ -113,14 +113,27 @@ python3 scripts/patch-src.py app/src
 log "4/6 权限规范化 + 软链接归一化"
 # 构建机路径泄漏防护：Chromium 目录等产物可能残留 /home/runner/... 之类绝对路径，
 # 一旦进入安装包，目标机上行为会与本地验证结果不一致。
-find app -type l | while read -r link; do
-  target="$(readlink -f "$link" 2>/dev/null || true)"
-  if [ -n "$target" ] && [ -e "$target" ]; then
-    cp -Lp --remove-destination "$target" "$link"
-  else
-    echo "WARN: 移除悬空软链: $link"
-    rm -f "$link"
-  fi
+# 软链物化必须区分文件与目录：cp -Lp 对目录型软链会以
+# "cp: -r not specified; omitting directory" 失败并返回非零，
+# 在 set -e 下直接终止构建（tzdata 的 posix/America -> ../America 就是这么炸的）。
+materialize_links() {
+  find app -type l -print0 | while IFS= read -r -d '' link; do
+    target="$(readlink -f "$link" 2>/dev/null || true)"
+    if [ -z "$target" ] || [ ! -e "$target" ]; then
+      echo "WARN: 移除悬空软链: $link"
+      rm -f "$link"
+    elif [ -d "$target" ]; then
+      rm -f "$link"
+      mkdir -p "$link"
+      cp -aL "$target/." "$link/"
+    else
+      cp -Lp --remove-destination "$target" "$link"
+    fi
+  done
+}
+for _pass in 1 2 3 4 5; do
+  [ -n "$(find app -type l -print -quit)" ] || break
+  materialize_links
 done
 [ -z "$(find app -type l)" ] || { echo "仍存在软链接，构建中止"; exit 1; }
 
@@ -136,6 +149,11 @@ find app -type f -perm /u+x -exec chmod a+x {} \; 2>/dev/null || true
 
 # 禁用脚本里的自引用（venv bin 目录），否则 fnOS 解压后可能覆盖出坏链接
 find app/dist/deps/bin -type l -delete 2>/dev/null || true
+
+# __pycache__ 的 .pyc 会把构建机绝对源码路径写进 co_filename
+# （实测 /vol2/.../app/dist/deps/playwright/__init__.py 会被 5.3 的泄漏检查拦下），
+# 运行时会自行重建，直接清掉。
+find app -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
 
 log "5/6 打包"
 VER="$(grep '^version' manifest | awk -F= '{print $2}' | tr -d ' ')"
