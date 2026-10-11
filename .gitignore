@@ -1,0 +1,9 @@
+# Build outputs and local CI caches
+.cache/
+dist/
+app/dist/
+app/src/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
