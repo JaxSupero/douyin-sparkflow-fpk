@@ -163,10 +163,37 @@ APT_ARCHIVES="$CACHE/apt-archives"
 APT_EMPTY_PARTS="$CACHE/apt-empty-parts"
 APT_SANDBOX_USER="$(id -un)"
 mkdir -p "$APT_LISTS/partial" "$APT_ARCHIVES/partial" "$APT_STATE/log" "$APT_EMPTY_PARTS"
-printf 'deb %s %s main\ndeb %s %s-updates main\ndeb %s %s-security main\n' \
-  "$DEBIAN_MIRROR" "$DEBIAN_SUITE" \
-  "$DEBIAN_MIRROR" "$DEBIAN_SUITE" \
-  "$DEBIAN_SECURITY_MIRROR" "$DEBIAN_SUITE" > "$APT_SOURCES"
+
+# Debian 源的签名密钥：Debian 宿主自带，Ubuntu runner 没有 —— 缺了 apt 会以
+# "repository is not signed" 退出 100。这里显式定位 keyring 并用 signed-by 绑定；
+# 实在找不到才降级 trusted=yes（并留下告警，不静默跳过校验）。
+DEBIAN_KEYRING=""
+for c in /usr/share/keyrings/debian-archive-keyring.gpg \
+         /etc/apt/trusted.gpg.d/debian-archive-keyring.gpg; do
+  [ -s "$c" ] && { DEBIAN_KEYRING="$c"; break; }
+done
+if [ -z "$DEBIAN_KEYRING" ]; then
+  SUDO=""
+  [ "$(id -u)" != "0" ] && command -v sudo >/dev/null 2>&1 && SUDO="sudo"
+  echo "未找到 Debian 签名密钥，尝试用宿主 apt 安装 debian-archive-keyring"
+  $SUDO apt-get install -y debian-archive-keyring >/dev/null 2>&1 || true
+  for c in /usr/share/keyrings/debian-archive-keyring.gpg \
+           /etc/apt/trusted.gpg.d/debian-archive-keyring.gpg; do
+    [ -s "$c" ] && { DEBIAN_KEYRING="$c"; break; }
+  done
+fi
+if [ -n "$DEBIAN_KEYRING" ]; then
+  SIGNED_BY="[signed-by=$DEBIAN_KEYRING]"
+  echo "使用 Debian 签名密钥：$DEBIAN_KEYRING"
+else
+  SIGNED_BY="[trusted=yes]"
+  echo "::warning:: 找不到 Debian 签名密钥，回退为 trusted=yes（不校验镜像签名）"
+fi
+
+printf 'deb %s %s %s main\ndeb %s %s %s-updates main\ndeb %s %s %s-security main\n' \
+  "$SIGNED_BY" "$DEBIAN_MIRROR" "$DEBIAN_SUITE" \
+  "$SIGNED_BY" "$DEBIAN_MIRROR" "$DEBIAN_SUITE" \
+  "$SIGNED_BY" "$DEBIAN_SECURITY_MIRROR" "$DEBIAN_SUITE" > "$APT_SOURCES"
 APT_SOURCES_WANT="$(sha256sum "$APT_SOURCES" | awk '{print $1}')"
 APT_OPTS=(
   -o "Dir::State::status=/dev/null"
