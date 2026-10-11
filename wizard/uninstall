@@ -1,0 +1,19 @@
+[{
+  "stepTitle": "卸载 抖音 SparkFlow",
+  "items": [
+    {
+      "type": "tips",
+      "helpText": "请选择数据清理方式。账号、登录态、浏览器配置和日志保存在应用数据目录中。"
+    },
+    {
+      "type": "radio",
+      "field": "wizard_keep_data",
+      "label": "保留应用数据（推荐 — 重装后可继续使用）",
+      "initValue": "yes",
+      "options": [
+        { "label": "保留数据", "value": "yes" },
+        { "label": "完全删除（账号、登录态、配置与日志全部清除）", "value": "no" }
+      ]
+    }
+  ]
+}]
