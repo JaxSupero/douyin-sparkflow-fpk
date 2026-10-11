@@ -154,6 +154,25 @@ jobs:
           echo "Using upstream commit $(git -C /tmp/upstream rev-parse HEAD)"
           bash scripts/prepare-deps.sh
 
+      - name: Dependency diagnostics
+        run: |
+          set -euo pipefail
+          echo "=== 总体积 ==="
+          du -sh app
+          du -sh app/dist/* 2>/dev/null || true
+          echo "=== chrome 明细 ==="
+          du -sh app/dist/chrome/* 2>/dev/null || true
+          echo "=== deps 明细（前 10 大）==="
+          du -sh app/dist/deps/* 2>/dev/null | sort -rh | head -10 || true
+          echo "=== 文件/软链计数 ==="
+          echo "app files      : $(find app -type f | wc -l)"
+          echo "chrome files   : $(find app/dist/chrome -type f | wc -l)"
+          echo "deps files     : $(find app/dist/deps -type f | wc -l)"
+          echo "display files  : $(find app/dist/display -type f | wc -l)"
+          echo "symlinks left  : $(find app -type l | wc -l)"
+          echo "=== app.tgz ==="
+          ls -l app.tgz 2>/dev/null || echo "(fnpack 尚未生成 app.tgz)"
+
       - name: Build FPK
         id: build
         env:
