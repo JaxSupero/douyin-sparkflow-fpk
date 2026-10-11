@@ -1,0 +1,7 @@
+{
+    "defaults": {
+        "run-as": "package"
+    },
+    "username": "douyin_sparkflow",
+    "groupname": "douyin_sparkflow"
+}
