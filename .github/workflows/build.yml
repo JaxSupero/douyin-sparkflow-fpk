@@ -101,7 +101,7 @@ jobs:
           fi
           git -C /tmp/cache-src checkout -q FETCH_HEAD
           SRC=/tmp/cache-src/DouYinSparkFlow
-          PW_VER="$(awk -F= '/^playwright==/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' "$SRC/requirements.txt")"
+          PW_VER="$(awk '/^playwright==/ {sub(/^playwright==/, ""); gsub(/[[:space:]]/, ""); print; exit}' "$SRC/requirements.txt")"
           REQ_HASH="$( { cat "$SRC/requirements.txt"; cat scripts/prepare-deps.sh; } | sha256sum | awk '{print $1}')"
           echo "pw_ver=${PW_VER}" >> "$GITHUB_OUTPUT"
           echo "req_hash=${REQ_HASH}" >> "$GITHUB_OUTPUT"
