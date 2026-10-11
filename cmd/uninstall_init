@@ -1,0 +1,34 @@
+#!/bin/bash
+# 抖音 SparkFlow（douyin_sparkflow）— 卸载前回调
+# 职责：尽力停止所有本应用进程（fnOS 通常已先调用 stop，这里兜底），
+# 不删除任何用户数据（数据保留由 uninstall_callback 按向导处理）。
+set -u
+
+APPNAME="douyin_sparkflow"
+APP_LINK="/var/apps/${APPNAME}"
+
+if [ -z "${TRIM_APPDEST:-}" ] || [ ! -d "${TRIM_APPDEST:-}" ]; then
+  [ -e "$APP_LINK" ] && TRIM_APPDEST="$(readlink -f "$APP_LINK" 2>/dev/null)"
+fi
+if [ -z "${TRIM_PKGVAR:-}" ] || [ ! -d "${TRIM_PKGVAR:-}" ]; then
+  [ -L "$APP_LINK/var" ] && TRIM_PKGVAR="$(readlink -f "$APP_LINK/var" 2>/dev/null)"
+fi
+
+# 1) 调用本应用生命周期 stop（走 PID 文件 + 进程组，干净收尾）
+if [ -x "${APP_LINK}/cmd/main" ]; then
+  timeout 60 bash "${APP_LINK}/cmd/main" stop >/dev/null 2>&1 || true
+fi
+
+# 2) 精准兜底：仅匹配本应用数据目录下的进程
+if [ -n "${TRIM_PKGVAR:-}" ]; then
+  pkill -9 -f "${TRIM_PKGVAR}/runtime/main.py" 2>/dev/null || true
+  pkill -9 -f "${TRIM_PKGVAR}/runtime/login_desktop_server.py" 2>/dev/null || true
+  pkill -9 -f "${TRIM_PKGVAR}/venv/bin" 2>/dev/null || true
+fi
+if [ -n "${TRIM_APPDEST:-}" ]; then
+  pkill -9 -f "${TRIM_APPDEST}/scripts/" 2>/dev/null || true
+  pkill -9 -f "${TRIM_APPDEST}/dist/display" 2>/dev/null || true
+fi
+
+sleep 1
+exit 0

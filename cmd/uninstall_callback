@@ -1,0 +1,20 @@
+#!/bin/bash
+# 抖音 SparkFlow（douyin_sparkflow）— 卸载后回调
+# wizard_keep_data="yes"（默认）：保留全部数据（账号、登录态、日志等）
+# wizard_keep_data="no"        ：删除应用数据目录中的全部内容
+set -u
+
+APPNAME="douyin_sparkflow"
+APP_LINK="/var/apps/${APPNAME}"
+
+if [ -z "${TRIM_PKGVAR:-}" ] || [ ! -d "${TRIM_PKGVAR:-}" ]; then
+  [ -L "$APP_LINK/var" ] && TRIM_PKGVAR="$(readlink -f "$APP_LINK/var" 2>/dev/null)"
+fi
+
+if [ "${wizard_keep_data:-yes}" = "no" ]; then
+  if [ -n "${TRIM_PKGVAR:-}" ] && [ -d "${TRIM_PKGVAR}" ] && [ "${TRIM_PKGVAR}" != "/" ]; then
+    find "${TRIM_PKGVAR}" -mindepth 1 -delete 2>/dev/null || true
+  fi
+fi
+
+exit 0

@@ -1,0 +1,81 @@
+#!/bin/bash
+# 抖音 SparkFlow（douyin_sparkflow）— 升级后回调
+# 职责：准备数据目录、把源码刷新到运行目录（保留用户数据）、
+#       复制字体、写入默认运行参数文件。幂等，可重复执行。
+set -u
+
+APPNAME="douyin_sparkflow"
+APP_LINK="/var/apps/${APPNAME}"
+ERR_FILE="${TRIM_TEMP_LOGFILE:-/tmp/${APPNAME}-install-error.log}"
+
+if [ -z "${TRIM_APPDEST:-}" ] || [ ! -d "${TRIM_APPDEST:-}" ]; then
+  [ -e "$APP_LINK" ] && TRIM_APPDEST="$(readlink -f "$APP_LINK" 2>/dev/null)"
+fi
+if [ -z "${TRIM_PKGVAR:-}" ] || [ ! -d "${TRIM_PKGVAR:-}" ]; then
+  [ -L "$APP_LINK/var" ] && TRIM_PKGVAR="$(readlink -f "$APP_LINK/var" 2>/dev/null)"
+fi
+
+fail() { echo "$1" > "$ERR_FILE"; exit 1; }
+
+[ -n "${TRIM_APPDEST:-}" ] || fail "无法解析应用安装目录。"
+[ -d "${TRIM_APPDEST}/src" ] || fail "安装包内容不完整（缺少 src 目录）。"
+[ -n "${TRIM_PKGVAR:-}" ] || fail "无法解析应用数据目录。"
+
+RUNTIME="${TRIM_PKGVAR}/runtime"
+
+# 1) 数据目录结构
+mkdir -p \
+  "${RUNTIME}/logs" \
+  "${TRIM_PKGVAR}/venv" \
+  "${TRIM_PKGVAR}/state" \
+  "${TRIM_PKGVAR}/browser-profiles" \
+  "${TRIM_PKGVAR}/login-profile" \
+  "${TRIM_PKGVAR}/cron" \
+  "${TRIM_PKGVAR}/run" \
+  "${TRIM_PKGVAR}/logs" \
+  "${TRIM_PKGVAR}/home/.local/share/fonts" \
+  "${TRIM_PKGVAR}/home/.cache" \
+  2>/dev/null \
+  || fail "创建应用数据目录失败。若从旧 Docker 版应用升级，请在 NAS 终端以 root 执行：chown -R douyin_sparkflow:douyin_sparkflow \"${TRIM_PKGVAR}\" 后重试。"
+
+# 2) 刷新源码：只替换代码目录，保留 config.json / usersData.json /
+#    webui_settings.json / logs / .im_sdk_cache 等用户数据（升级重装不丢账号）。
+for d in core webui utils scripts docs; do
+  rm -rf "${RUNTIME:?}/$d"
+done
+cp -a "${TRIM_APPDEST}/src/." "${RUNTIME}/" || fail "复制应用源码失败（请检查数据目录权限）。"
+
+# 3) 中文字体：一次性复制到用户字体目录（Chromium 渲染中文页面需要）
+FONT_SRC="${TRIM_APPDEST}/dist/display/fonts"
+FONT_DST="${TRIM_PKGVAR}/home/.local/share/fonts"
+if [ -d "$FONT_SRC" ] && [ -z "$(ls -A "$FONT_DST" 2>/dev/null)" ]; then
+  cp -a "$FONT_SRC"/. "$FONT_DST"/ 2>/dev/null || true
+fi
+
+# 4) 运行参数覆盖文件（用户可编辑；修改后重启应用生效）
+FPK_ENV="${TRIM_PKGVAR}/fpk.env"
+if [ ! -f "$FPK_ENV" ]; then
+  cat > "$FPK_ENV" <<'EOF'
+# 抖音 SparkFlow — 运行参数覆盖（修改后请重启应用）
+# 登录浏览器的网络模式：auto（先直连，失败再走代理）/ direct（仅直连）/ proxy（仅代理）
+LOGIN_DESKTOP_PROXY_MODE=auto
+# 代理地址（auto 回退或 proxy 模式时使用；不需要可留空字符串）
+LOGIN_DESKTOP_PROXY=http://127.0.0.1:7890
+# 可选端口覆盖（一般无需修改）
+#WEB_PORT=8787
+#LOGIN_DESKTOP_API_PORT=18090
+#LOGIN_DESKTOP_VNC_PORT=5901
+#LOGIN_DESKTOP_WEB_PORT=6080
+EOF
+fi
+
+# 5) 隐私目录权限收敛
+chmod 700 "${TRIM_PKGVAR}/browser-profiles" "${TRIM_PKGVAR}/login-profile" 2>/dev/null || true
+
+# 6) 若以 root 执行生命周期（特权准备场景），修正数据目录属主；
+#    兼容从旧 Docker 版（docker-douyin-sparkflow 用户）迁移的数据目录。
+if [ "$(id -u)" = "0" ] && [ -n "${TRIM_USERNAME:-}" ]; then
+  chown -R "${TRIM_USERNAME}:${TRIM_GROUPNAME:-${TRIM_USERNAME}}" "${TRIM_PKGVAR}" 2>/dev/null || true
+fi
+
+exit 0

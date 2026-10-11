@@ -1,0 +1,47 @@
+#!/bin/bash
+# 抖音 SparkFlow（douyin_sparkflow）— 升级前回调
+# 职责：清理残留进程（含旧 Docker 版容器）、确认端口空闲；
+# 本脚本必须保持幂等（失败重装/重复执行均安全）。
+set -u
+
+APPNAME="douyin_sparkflow"
+APP_LINK="/var/apps/${APPNAME}"
+ERR_FILE="${TRIM_TEMP_LOGFILE:-/tmp/${APPNAME}-install-error.log}"
+
+# --- TRIM_* 兜底解析（部分调用场景可能不传）---
+if [ -z "${TRIM_APPDEST:-}" ] || [ ! -d "${TRIM_APPDEST:-}" ]; then
+  [ -e "$APP_LINK" ] && TRIM_APPDEST="$(readlink -f "$APP_LINK" 2>/dev/null)"
+fi
+if [ -z "${TRIM_PKGVAR:-}" ] || [ ! -d "${TRIM_PKGVAR:-}" ]; then
+  [ -L "$APP_LINK/var" ] && TRIM_PKGVAR="$(readlink -f "$APP_LINK/var" 2>/dev/null)"
+fi
+
+fail() { echo "$1" > "$ERR_FILE"; exit 1; }
+
+# 1) 残留进程清理：只使用本应用专属路径锚定，绝不使用宽泛关键字，
+#    避免误杀其它应用（同名关键字在其他应用中可能存在）。
+if [ -n "${TRIM_PKGVAR:-}" ]; then
+  pkill -9 -f "${TRIM_PKGVAR}/runtime/main.py" 2>/dev/null || true
+  pkill -9 -f "${TRIM_PKGVAR}/runtime/login_desktop_server.py" 2>/dev/null || true
+  pkill -9 -f "${TRIM_PKGVAR}/venv/bin" 2>/dev/null || true
+fi
+if [ -n "${TRIM_APPDEST:-}" ]; then
+  pkill -9 -f "${TRIM_APPDEST}/scripts/" 2>/dev/null || true
+  pkill -9 -f "${TRIM_APPDEST}/dist/display" 2>/dev/null || true
+fi
+
+# 2) 旧 Docker 版（v1.0.x）可能的容器：尽力移除，失败（无权限/无 docker）不阻断。
+if command -v docker >/dev/null 2>&1; then
+  timeout 20 docker rm -f douyin-sparkflow-web douyin-sparkflow-login \
+    douyin-sparkflow-scheduler douyin-sparkflow-task >/dev/null 2>&1 || true
+fi
+sleep 1
+
+# 3) 端口占用检查：正常升级安装时端口应为空闲（旧版已随卸载停止）。
+if command -v ss >/dev/null 2>&1; then
+  if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]8787$"; then
+    fail "端口 8787 已被占用：请先停止占用该端口的服务（或旧版 SparkFlow 容器）后再安装。"
+  fi
+fi
+
+exit 0

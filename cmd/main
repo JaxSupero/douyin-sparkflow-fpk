@@ -1,0 +1,222 @@
+#!/bin/bash
+# 抖音 SparkFlow（douyin_sparkflow）— fnOS 生命周期管理（原生部署）
+#
+# start  → 引导 venv/配置 → 拉起「登录桌面栈 + 调度器 + Web」三个后台组，等待 8787 就绪
+# stop        → 按进程组优雅停止全部子进程，并扫尾残留
+# status      → 8787 端口监听视为运行中（exit 0），否则 exit 3
+set -u
+
+APPNAME="douyin_sparkflow"
+APP_LINK="/var/apps/${APPNAME}"
+ERR_FILE="${TRIM_TEMP_LOGFILE:-/tmp/${APPNAME}-error.log}"
+
+# ---------- TRIM 路径解析（含 symlink 兜底，绝不硬编码卷号） ----------
+if [ -z "${TRIM_APPDEST:-}" ] || [ ! -d "${TRIM_APPDEST:-}" ]; then
+  [ -e "$APP_LINK" ] && TRIM_APPDEST="$(readlink -f "$APP_LINK" 2>/dev/null)"
+fi
+if [ -z "${TRIM_PKGVAR:-}" ] || [ ! -d "${TRIM_PKGVAR:-}" ]; then
+  [ -L "$APP_LINK/var" ] && TRIM_PKGVAR="$(readlink -f "$APP_LINK/var" 2>/dev/null)"
+fi
+if [ -z "${TRIM_PKGVAR:-}" ] && [ -n "${TRIM_APPDEST:-}" ]; then
+  _v="$(echo "$TRIM_APPDEST" | sed 's|/@appcenter/|/@appdata/|')"
+  [ -d "$_v" ] && TRIM_PKGVAR="$_v"
+fi
+if [ -z "${TRIM_APPDEST:-}" ] || [ -z "${TRIM_PKGVAR:-}" ]; then
+  echo "无法解析应用目录（APPDEST='${TRIM_APPDEST:-}' PKGVAR='${TRIM_PKGVAR:-}'）。" > "$ERR_FILE"
+  exit 1
+fi
+export TRIM_APPDEST TRIM_PKGVAR
+
+SCRIPTS="${TRIM_APPDEST}/scripts"
+RUNDIR="${TRIM_PKGVAR}/run"
+LOGDIR="${TRIM_PKGVAR}/logs"
+mkdir -p "$RUNDIR" "$LOGDIR" 2>/dev/null
+
+# 用户运行参数覆盖（端口/代理等）
+[ -f "${TRIM_PKGVAR}/fpk.env" ] && . "${TRIM_PKGVAR}/fpk.env"
+WEB_PORT="${WEB_PORT:-8787}"
+
+log() { echo "$(date '+%F %T') [main] $*" >> "${LOGDIR}/main.log" 2>/dev/null || true; }
+
+find_python312() {
+  local p
+  p="${DOUYIN_PYTHON_BIN:-}"
+  if [ -n "$p" ] && [ -x "$p" ]; then echo "$p"; return 0; fi
+  for p in /var/apps/python312/target/bin/python3 /var/apps/python312/target/bin/python3.12; do
+    [ -x "$p" ] && { echo "$p"; return 0; }
+  done
+  return 1
+}
+
+port_listening() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${WEB_PORT}$"
+  else
+    netstat -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${WEB_PORT}$"
+  fi
+}
+
+# 递归结束进程树（Linux /proc children 链表）
+kill_tree() {
+  local pid="$1" sig="$2" kid
+  [ -n "$pid" ] || return 0
+  for kid in $(cat /proc/"$pid"/task/*/children 2>/dev/null); do
+    kill_tree "$kid" "$sig"
+  done
+  kill -"$sig" "$pid" 2>/dev/null || true
+}
+
+start_one() {
+  local name="$1" script="$2"
+  local pidfile="${RUNDIR}/${name}.pid" logfile="${LOGDIR}/${name}.log"
+  if [ -f "$pidfile" ]; then
+    local oldpid
+    oldpid="$(cat "$pidfile" 2>/dev/null | tr -d '[:space:]')"
+    if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
+      log "${name} already running pid=${oldpid}"
+      return 0
+    fi
+    rm -f "$pidfile"
+  fi
+  [ -f "$script" ] || { log "script missing: $script"; return 1; }
+  # setsid：让包装脚本成为会话/进程组首进程，便于整组停止；
+  # 由内层 bash 写入自己的真实 PID（避免 setsid 可能 fork 导致 PID 失准）。
+  setsid bash -c "echo \$\$ > '$pidfile'; exec bash '$script'" </dev/null >>"$logfile" 2>&1 &
+  log "${name} launched (pidfile=$pidfile)"
+  return 0
+}
+
+stop_one() {
+  local name="$1"
+  local pidfile="${RUNDIR}/${name}.pid" pid i
+  [ -f "$pidfile" ] || return 0
+  pid="$(cat "$pidfile" 2>/dev/null | tr -d '[:space:]')"
+  rm -f "$pidfile"
+  [ -n "$pid" ] || return 0
+  if ! kill -0 "$pid" 2>/dev/null; then
+    return 0
+  fi
+  log "stopping ${name} pid=${pid}"
+  # 优先整组 TERM（子进程都在同组），再逐树兜底
+  if [ "$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]')" = "$pid" ]; then
+    kill -TERM -- "-${pid}" 2>/dev/null || true
+  fi
+  kill_tree "$pid" TERM
+  for i in $(seq 1 15); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 1
+  done
+  log "force killing ${name} pid=${pid}"
+  kill_tree "$pid" KILL
+  sleep 1
+  return 0
+}
+
+sweep_leftovers() {
+  # 仅使用本应用专属路径锚定的模式，避免影响其它应用/用户。
+  pkill -f "${TRIM_PKGVAR}/runtime/main.py" 2>/dev/null || true
+  pkill -f "${TRIM_PKGVAR}/runtime/login_desktop_server.py" 2>/dev/null || true
+  pkill -f "${TRIM_PKGVAR}/venv/bin" 2>/dev/null || true
+  pkill -f "${TRIM_APPDEST}/scripts/" 2>/dev/null || true
+  pkill -f "${TRIM_APPDEST}/dist/display" 2>/dev/null || true
+  # Xvfb / x11vnc / websockify 由上面的 dist/display 模式覆盖；
+  # 若 display.env 记录了显示号，再按显示号补一刀。
+  if [ -f "${RUNDIR}/display.env" ]; then
+    # shellcheck disable=SC1090
+    . "${RUNDIR}/display.env"
+    if [ -n "${DISPLAY:-}" ]; then
+      pkill -f "Xvfb ${DISPLAY}" 2>/dev/null || true
+      pkill -f "x11vnc .*-display ${DISPLAY}" 2>/dev/null || true
+    fi
+  fi
+  sleep 1
+  return 0
+}
+
+do_bootstrap() {
+  local py="$1"
+  "$py" "${SCRIPTS}/bootstrap.py" >> "${LOGDIR}/bootstrap.log" 2>&1
+}
+
+do_start() {
+  if port_listening; then
+    log "already running (port ${WEB_PORT} listening)"
+    return 0
+  fi
+
+  local py
+  py="$(find_python312)" || {
+    echo "未检测到 Python 3.12 运行时：请先在应用中心安装「Python 3.12」应用，然后重试启动。" > "$ERR_FILE"
+    return 1
+  }
+  [ -f "${SCRIPTS}/bootstrap.py" ] || { echo "应用脚本不完整（缺少 bootstrap.py）。" > "$ERR_FILE"; return 1; }
+  [ -d "${TRIM_PKGVAR}/runtime" ] || { echo "应用数据目录不完整：请卸载后重新安装。" > "$ERR_FILE"; return 1; }
+
+  log "=== start begin (python=${py}) ==="
+
+  # 1) 引导：venv 同步 + 历史配置路径修复（幂等）
+  if ! do_bootstrap "$py"; then
+    echo "运行环境准备失败：请查看应用日志（${LOGDIR}/bootstrap.log）。" > "$ERR_FILE"
+    return 1
+  fi
+  [ -x "${TRIM_PKGVAR}/venv/bin/python" ] || {
+    echo "Python 虚拟环境创建失败：请查看应用日志（${LOGDIR}/bootstrap.log）。" > "$ERR_FILE"
+    return 1
+  }
+
+  # 2) 清理上一次可能残留的半死进程（不做状态判断，直接按 PID 文件+路径扫）
+  stop_one web; stop_one scheduler; stop_one login
+  sweep_leftovers
+
+  # 3) 依次拉起：登录桌面栈 → 调度器 → Web
+  start_one login "${SCRIPTS}/login_stack.sh" || { echo "登录桌面栈启动失败。" > "$ERR_FILE"; return 1; }
+  start_one scheduler "${SCRIPTS}/scheduler.sh" || { echo "任务调度器启动失败。" > "$ERR_FILE"; return 1; }
+  start_one web "${SCRIPTS}/web.sh" || { echo "Web 服务启动失败。" > "$ERR_FILE"; return 1; }
+
+  # 4) 等待 Web 就绪（最多 120s；web 进程早退则快速失败）
+  local i webpid
+  for i in $(seq 1 120); do
+    if port_listening; then
+      log "started, port ${WEB_PORT} listening (after ${i}s)"
+      return 0
+    fi
+    webpid="$(cat "${RUNDIR}/web.pid" 2>/dev/null | tr -d '[:space:]')"
+    if [ -n "$webpid" ] && ! kill -0 "$webpid" 2>/dev/null && [ "$i" -gt 6 ]; then
+      # web.sh 内部有重启循环，进程消失说明脚本自身出错
+      echo "Web 进程异常退出，请查看应用日志（${LOGDIR}/web.log）。" > "$ERR_FILE"
+      return 1
+    fi
+    sleep 1
+  done
+  echo "Web 服务在 120 秒内未就绪，请查看应用日志（${LOGDIR}/web.log）。" > "$ERR_FILE"
+  return 1
+}
+
+do_stop() {
+  log "=== stop begin ==="
+  stop_one web
+  stop_one scheduler
+  stop_one login
+  sweep_leftovers
+  log "=== stop done ==="
+  return 0
+}
+
+case "${1:-}" in
+  start)
+    do_start
+    ;;
+  stop)
+    do_stop
+    ;;
+  status)
+    if port_listening; then
+      exit 0
+    fi
+    exit 3
+    ;;
+  *)
+    echo "用法: $0 {start|stop|status}" > "$ERR_FILE"
+    exit 1
+    ;;
+esac
