@@ -6,8 +6,8 @@
 ## 交付物
 
 ```text
-dist/fnos-douyin_sparkflow_v1.1.0.fpk          # ~387 MB
-dist/fnos-douyin_sparkflow_v1.1.0.fpk.sha256
+dist/fnos-douyin_sparkflow_v<version>.fpk      # v1.1.1 实测 744,824,439 B（≈711 MiB）
+dist/fnos-douyin_sparkflow_v<version>.fpk.sha256
 ```
 
 `build-fpk.sh` 每次构建后把实际 SHA-256 写入同名 `.sha256` 文件，以该文件为准。
@@ -43,9 +43,9 @@ douyin-sparkflow-fpk/
 ├── app/
 │   ├── src/                     # 上游源码（构建时同步 + 打补丁）
 │   ├── scripts/                 # 运行时脚本：bootstrap.py、login_stack.sh、web.sh、scheduler.sh、common.sh
-│   ├── dist/deps/               # Python 3.12 依赖（233 MB）
+│   ├── dist/deps/               # Python 3.12 依赖（235 MB）
 │   ├── dist/chrome/             # Playwright Chromium（924 MB）
-│   ├── dist/display/            # X/VNC 组件 + 字体 + xkbcomp 垫片（54 MB）
+│   ├── dist/display/            # X/VNC 组件 + 字体 + xkbcomp 垫片（652 MB）
 │   ├── dist/novnc/              # noVNC 1.5.0 静态资源
 │   └── ui/                      # 桌面入口（8787 端口）
 └── scripts/
