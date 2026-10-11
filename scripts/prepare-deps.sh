@@ -34,7 +34,7 @@ DEBIAN_SECURITY_MIRROR="${DEBIAN_SECURITY_MIRROR:-https://deb.debian.org/debian-
 
 # fnOS 宿主的 /usr/bin 没有 xkbcomp，但 xorg 编译期写死了这个绝对路径，
 # 需要随包带上并由 xkbcomp-shim.so 重定向。缺它 Xvfb 会直接 Fatal server error。
-DEFAULT_DISPLAY_PKGS="xvfb x11vnc fluxbox xkb-data x11-common libxfont2 libimlib2 libspectre1 libvncclient1 libvncserver1 libx11-xkb-utils"
+DEFAULT_DISPLAY_PKGS="xvfb x11vnc fluxbox xkb-data x11-common libxfont2 libimlib2 libspectre1 libvncclient1 libvncserver1 x11-xkb-utils"
 DEFAULT_FONT_PKGS="fonts-wqy-zenhei fonts-wqy-microhei fonts-noto-color-emoji"
 
 if [ "${OFFLINE:-0}" = "1" ] && [ "${FORCE_REBUILD_DEPS:-0}" = "1" ]; then
