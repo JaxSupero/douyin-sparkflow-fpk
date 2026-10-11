@@ -1,0 +1,87 @@
+name: Auto-update upstream
+
+# 自动跟踪上游 douyin-sparkflow 的 main 分支并触发重建。
+#
+# 上游没有打 tag / 发 release（版本只记在 CHANGELOG 的日期条目里），
+# 因此这里跟踪的是 **main 分支 HEAD 的 commit SHA**：
+#   - 用 git ls-remote 拿 HEAD（单请求、无 API 限流、无需 token）
+#   - 与 config/bootstrap/upstream.env 里的 UPSTREAM_SHA 比对
+#   - 变化时更新固定 SHA 并递增 manifest patch 版本，然后 repository_dispatch 构建
+#   - 无变化时完全不改文件，也不触发构建
+#
+# 频率：每天 3 次（UTC 01:17 / 09:17 / 17:17）。避开整点。
+
+on:
+  schedule:
+    - cron: '17 1,9,17 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
+
+      - name: Detect latest upstream commit
+        id: detect
+        env:
+          UPSTREAM_REPO: halfwaystudent/douyin-sparkflow
+        run: |
+          set -euo pipefail
+          API="https://api.github.com/repos/${UPSTREAM_REPO}"
+          LATEST_JSON="$(curl --retry 3 --retry-delay 5 --retry-all-errors -fsSL --max-time 60 "${API}/commits/main")"
+          LATEST_SHA="$(printf '%s' "$LATEST_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])')"
+          LATEST_DATE="$(printf '%s' "$LATEST_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["commit"]["committer"]["date"][:10])')"
+          [[ "$LATEST_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error:: invalid upstream SHA"; exit 1; }
+          PROBE="$(mktemp -d)"
+          trap 'rm -rf "$PROBE"' EXIT
+          git -C "$PROBE" init -q
+          git -C "$PROBE" remote add origin "https://github.com/${UPSTREAM_REPO}.git"
+          git -C "$PROBE" fetch -q --depth 1 origin "$LATEST_SHA"
+          printf 'sha=%s\ndate=%s\n' "$LATEST_SHA" "$LATEST_DATE" >> "$GITHUB_OUTPUT"
+          echo "upstream main: ${LATEST_SHA} (${LATEST_DATE})"
+
+      - name: Compare and bump version
+        id: bump
+        run: |
+          set -euo pipefail
+          python3 scripts/update-upstream.py \
+            "${{ steps.detect.outputs.sha }}" \
+            "${{ steps.detect.outputs.date }}" \
+            config/bootstrap/upstream.env manifest "$GITHUB_OUTPUT"
+
+      - name: Commit upstream pin and FPK version
+        if: steps.bump.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add config/bootstrap/upstream.env manifest
+          git commit -m "chore: update upstream pin and bump FPK version"
+          git push
+
+      - name: Dispatch FPK build
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPOSITORY: ${{ github.repository }}
+          UPSTREAM_SHA: ${{ steps.detect.outputs.sha }}
+          UPSTREAM_DATE: ${{ steps.detect.outputs.date }}
+        run: |
+          set -euo pipefail
+          jq -n --arg sha "$UPSTREAM_SHA" --arg date "$UPSTREAM_DATE" \
+            '{event_type:"upstream-updated",client_payload:{sha:$sha,date:$date}}' \
+            | curl --retry 3 --retry-delay 5 --retry-all-errors -fsSL -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -H "Content-Type: application/json" \
+              "https://api.github.com/repos/$GH_REPOSITORY/dispatches" \
+              --data-binary @-

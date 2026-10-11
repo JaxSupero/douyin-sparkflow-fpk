@@ -1,0 +1,232 @@
+name: Build fnOS FPK
+
+# 构建 douyin-sparkflow 的飞牛 FPK 并发布 Release。
+#
+# 构建要点：
+#   - X 组件必须从 Debian bookworm 源解析，不能用 Ubuntu runner 的 apt 源，
+#     否则包内会是 Ubuntu 的二进制，在 fnOS（Debian 12）上跑不起来。
+#   - Python 依赖用 uv 交叉安装 cp312 轮子（构建机是 Ubuntu，解释器版本不匹配）。
+#   - app/dist 体积约 1.2GB，actions/cache 按依赖指纹、Playwright 版本分别缓存。
+#   - fnpack 官方 CDN 可能不可达，脚本内置 tar+gzip 兜底构建。
+#   - build-fpk.sh 校验 checksum、关键成员和构建机路径泄漏。
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      force_rebuild_deps:
+        description: '强制重新下载全部依赖（忽略缓存）'
+        type: boolean
+        default: false
+  repository_dispatch:
+    types: [upstream-updated]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fpk-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APP_NAME: douyin_sparkflow
+  MANIFEST_FILE: manifest
+
+jobs:
+  build-fpk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Resolve upstream commit to build
+        id: upstream
+        env:
+          DISPATCH_SHA: ${{ github.event.client_payload.sha }}
+        run: |
+          set -euo pipefail
+          SHA="${DISPATCH_SHA:-$(awk -F= '$1=="UPSTREAM_SHA" {print $2}' config/bootstrap/upstream.env 2>/dev/null || true)}"
+          DATE="$(awk -F= '$1=="UPSTREAM_DATE" {print $2}' config/bootstrap/upstream.env 2>/dev/null || true)"
+          if [ -z "$SHA" ]; then
+            echo "sha=" >> "$GITHUB_OUTPUT"
+            echo "date=" >> "$GITHUB_OUTPUT"
+            echo "msg=untracked main HEAD" >> "$GITHUB_OUTPUT"
+            echo "Upstream is not pinned; build step will fetch main HEAD."
+          else
+            [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error:: invalid pinned upstream SHA"; exit 1; }
+            echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+            echo "date=$DATE" >> "$GITHUB_OUTPUT"
+            echo "msg=upstream commit $SHA" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install fnpack (optional)
+        continue-on-error: true
+        run: |
+          set +e
+          for v in 1.2.4 1.0.4; do
+            URL="https://static2.fnnas.com/fnpack/fnpack-${v}-linux-amd64"
+            echo "尝试下载 fnpack ${v} ..."
+            if curl -fsSL --retry 3 --max-time 180 "$URL" -o fnpack \
+               && chmod +x fnpack \
+               && ./fnpack --help 2>&1 | grep -q "fnOS"; then
+              sudo mv fnpack /usr/local/bin/fnpack
+              fnpack --help 2>&1 | head -3
+              echo "fnpack ${v} 就绪"
+              exit 0
+            fi
+            rm -f fnpack
+          done
+          echo "::warning:: fnpack 不可用，将使用 tar+gzip 兜底构建"
+
+      # app/dist 约 1.2GB（Chromium 924MB + Python 依赖 233MB + X 组件 54MB）。
+      # 按内容哈希分键：上游 requirements.txt 变化才会失效 Python 依赖缓存，
+      # playwright 版本变化才会失效 Chromium 缓存，其余情况直接命中。
+      - name: Compute cache keys
+        id: cachekey
+        env:
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+        run: |
+          set -euo pipefail
+          REPO=https://github.com/halfwaystudent/douyin-sparkflow.git
+          git init -q /tmp/cache-src
+          git -C /tmp/cache-src remote add origin "$REPO"
+          if [ -n "$UPSTREAM_SHA" ]; then
+            git -C /tmp/cache-src fetch -q --depth 1 origin "$UPSTREAM_SHA"
+          else
+            git -C /tmp/cache-src fetch -q --depth 1 origin main
+          fi
+          git -C /tmp/cache-src checkout -q FETCH_HEAD
+          SRC=/tmp/cache-src/DouYinSparkFlow
+          PW_VER="$(awk -F= '/^playwright==/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' "$SRC/requirements.txt")"
+          REQ_HASH="$( { cat "$SRC/requirements.txt"; cat scripts/prepare-deps.sh; } | sha256sum | awk '{print $1}')"
+          echo "pw_ver=${PW_VER}" >> "$GITHUB_OUTPUT"
+          echo "req_hash=${REQ_HASH}" >> "$GITHUB_OUTPUT"
+      - name: Restore Python deps cache
+        id: cache-deps
+        uses: actions/cache@v4
+        with:
+          path: app/dist/deps
+          key: ${{ runner.os }}-deps-${{ steps.cachekey.outputs.req_hash }}-${{ hashFiles('scripts/prepare-deps.sh') }}
+
+      - name: Restore Chromium cache
+        id: cache-chrome
+        uses: actions/cache@v4
+        with:
+          path: app/dist/chrome
+          key: ${{ runner.os }}-chrome-${{ steps.cachekey.outputs.pw_ver }}-${{ hashFiles('scripts/prepare-deps.sh') }}
+
+      - name: Restore display + noVNC cache
+        id: cache-display
+        uses: actions/cache@v4
+        with:
+          path: |
+            app/dist/display
+            app/dist/novnc
+            .cache/apt-state
+            .cache/debs
+          key: ${{ runner.os }}-display-${{ hashFiles('scripts/prepare-deps.sh') }}-debian12-${{ hashFiles('scripts/xkbcomp-shim.c') }}
+
+      # X 组件解析必须显式指定 Debian 源：runner 是 Ubuntu，用它自己的 apt 源
+      # 会拿到 Ubuntu 包，产物在 fnOS 上不可用（glibc/依赖版本不同）。
+      - name: Prepare offline dependencies
+        env:
+          DEBIAN_SUITE: bookworm
+          DEBIAN_MIRROR: https://mirrors.ustc.edu.cn/debian
+          DEBIAN_SECURITY_MIRROR: https://mirrors.ustc.edu.cn/debian-security
+          ROOT: ${{ github.workspace }}
+          SRC_DIR: /tmp/upstream/DouYinSparkFlow
+          FORCE_REBUILD_DEPS: ${{ inputs.force_rebuild_deps == true && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/upstream
+          git init -q /tmp/upstream
+          git -C /tmp/upstream remote add origin https://github.com/halfwaystudent/douyin-sparkflow.git
+          if [ -n "${{ steps.upstream.outputs.sha }}" ]; then
+            git -C /tmp/upstream fetch -q --depth 1 origin "${{ steps.upstream.outputs.sha }}"
+          else
+            git -C /tmp/upstream fetch -q --depth 1 origin main
+          fi
+          git -C /tmp/upstream checkout -q FETCH_HEAD
+          echo "Using upstream commit $(git -C /tmp/upstream rev-parse HEAD)"
+          bash scripts/prepare-deps.sh
+
+      - name: Build FPK
+        id: build
+        env:
+          ALLOW_FALLBACK: '1'
+          SRC_DIR: /tmp/upstream/DouYinSparkFlow
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+        run: |
+          set -euo pipefail
+          bash scripts/build-fpk.sh
+          VERSION="$(awk -F= '/^version[[:space:]]*=/ {gsub(/[[:space:]]/,"",$2); print $2}' manifest)"
+          TARGET="dist/fnos-${APP_NAME}_v${VERSION}.fpk"
+          [ -f "$TARGET" ] || { echo "::error:: missing $TARGET"; ls -la dist/; exit 1; }
+          sha256sum "$TARGET" | tee "$TARGET.sha256"
+          echo "fpk=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build Summary
+        run: |
+          {
+            echo "### ✅ 构建完成"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "|------|-----|"
+            echo "| FPK 版本 | \`${{ steps.build.outputs.version }}\` |"
+            echo "| 上游 commit | \`${{ steps.upstream.outputs.sha || 'main HEAD' }}\` |"
+            echo "| 上游日期 | ${{ steps.upstream.outputs.date || '-' }} |"
+            echo "| 文件 | \`${{ steps.build.outputs.fpk }}\` |"
+            echo "| 依赖缓存 | deps=${{ steps.cache-deps.outputs.cache-hit != '' && '命中' || '未命中' }} / chrome=${{ steps.cache-chrome.outputs.cache-hit != '' && '命中' || '未命中' }} / display=${{ steps.cache-display.outputs.cache-hit != '' && '命中' || '未命中' }} |"
+            echo ""
+            echo "滚动最新版见 Release **latest**；固定版本见 Release \`v<manifest版本>\`。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Prepare rolling release assets
+        run: |
+          set -euo pipefail
+          cp "${{ steps.build.outputs.fpk }}" "dist/fnos-${APP_NAME}.fpk"
+          cp "${{ steps.build.outputs.fpk }}.sha256" "dist/fnos-${APP_NAME}.fpk.sha256"
+
+      - name: Publish rolling release (latest)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "Latest FPK (auto-build)"
+          prerelease: true
+          overwrite_files: true
+          files: |
+            dist/fnos-${{ env.APP_NAME }}.fpk
+            dist/fnos-${{ env.APP_NAME }}.fpk.sha256
+          body: |
+            抖音 SparkFlow for fnOS（原生部署，非 Docker）— 自动构建
+            - FPK version: `${{ steps.build.outputs.version }}`
+            - Upstream commit: `${{ steps.upstream.outputs.sha || 'main HEAD' }}`
+            下载 `fnos-douyin_sparkflow.fpk` 获取滚动版。
+
+      - name: Publish versioned release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.build.outputs.version }}
+          name: "抖音 SparkFlow v${{ steps.build.outputs.version }}"
+          prerelease: false
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          files: |
+            ${{ steps.build.outputs.fpk }}
+            ${{ steps.build.outputs.fpk }}.sha256
+          body: |
+            抖音 SparkFlow for fnOS（原生部署，非 Docker）
+            - FPK version: `${{ steps.build.outputs.version }}`
+            - Upstream commit: `${{ steps.upstream.outputs.sha || 'main HEAD' }}`
+            - Upstream date: `${{ steps.upstream.outputs.date || '-' }}`
+            - 仅支持 x86_64；上游许可仅限非商业用途。
+
+      - name: Cache cleanup
+        if: always()
+        run: |
+          rm -rf .cache/tools .cache/apt-archives
