@@ -80,6 +80,23 @@ fi
 
 # ─────────────────────────────────────────────
 log "1/6 环境检查"
+# 图标文件名大小写归一化：fnpack 与下面的兜底 tar 都硬编码 ICON.PNG / ICON_256.PNG，
+# 而 Windows / 浏览器另存常写成小写 .png，Linux 上两者是不同文件，直接打包会报
+# "Required file ICON.PNG is missing" 并让整个构建失败。构建前统一收敛成大写。
+normalize_icons() {
+  local src
+  for src in ICON.png ICON_256.png icon.png icon_256.png; do
+    [ -f "$src" ] || continue
+    want="$(printf '%s' "$src" | tr '[:lower:]' '[:upper:]')"
+    if [ "$src" != "$want" ]; then
+      mv -f "$src" "$want"
+      echo "图标名归一化：$src -> $want"
+    fi
+  done
+}
+normalize_icons
+[ -f ICON.PNG ] || { echo "缺少 ICON.PNG（fnpack 必备）" >&2; exit 1; }
+[ -f ICON_256.PNG ] || { echo "缺少 ICON_256.PNG（fnpack 必备）" >&2; exit 1; }
 if [ "${SKIP_DEPS_CHECK:-0}" != "1" ]; then
   for d in deps chrome display novnc; do
     [ -e "app/dist/$d" ] || { echo "缺少 app/dist/$d：请先运行 scripts/prepare-deps.sh" >&2; exit 1; }
