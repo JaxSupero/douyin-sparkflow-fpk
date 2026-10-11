@@ -98,6 +98,9 @@ fi
 # 但会被 build-fpk.sh 的构建机路径泄漏检查拦下，故在此统一清理。
 find "$DIST/deps" -maxdepth 2 -type d -name sboms -exec rm -rf {} + 2>/dev/null || true
 
+# .pyc 会把构建机绝对源码路径写进 co_filename，清掉（运行时会自行重建）
+find "$DIST/deps" -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
+
 echo "deps-version: $(cat "$DIST/deps/.deps-version")"
 
 # ─────────────────────────────────────────────────────────────
@@ -276,9 +279,13 @@ extract_debs() {
     dpkg-deb -x "$DEBS/$(basename "$url")" "$stage"
   done < "$list"
   # 裁剪文档类内容（仅 Debian 根布局；Ubuntu runner 的 /usr/local 会被忽略）
+  # usr/share/zoneinfo 一并裁掉：Xvfb/x11vnc/fluxbox 不需要时区库，宿主自带；
+  # 而且 tzdata 里含大量目录型软链（如 posix/America -> ../America），
+  # 与打包阶段的「软链物化」互相冲突。
   rm -rf "$stage/usr/share/doc" "$stage/usr/share/man" "$stage/usr/share/lintian" \
          "$stage/usr/share/bug" "$stage/usr/share/info" "$stage/usr/share/gettext" \
-         "$stage/usr/share/locale" "$stage/usr/share/xml" "$stage/usr/bin/Xephyr" \
+         "$stage/usr/share/locale" "$stage/usr/share/xml" "$stage/usr/share/zoneinfo" \
+         "$stage/usr/bin/Xephyr" \
          "$stage/usr/bin/Xvfb.lock" "$stage/usr/share/applications" \
          "$stage/usr/share/mime" "$stage/usr/share/sgml" 2>/dev/null || true
 }
