@@ -11,6 +11,12 @@
    - DEFAULT_APP_SETTINGS.ops_log_file 支持 SPARKFLOW_OPS_LOG_FILE 覆盖。
 3. webui/login_lock.py
    - 登录工作区锁文件目录支持 SPARKFLOW_STATE_DIR 覆盖（默认 /opt 不变）。
+4. webui/app.py
+   - public_app_settings() 的 allowed_keys 补上 douyin_network_mode /
+     douyin_proxy_url。上游漏暴露这两个键，而 settings.html 的「系统」表单与
+     POST /settings 都在用它们：保存其实已落盘，但页面永远回显默认值，
+     用户看到的现象是「网络出口/Mihomo 代理地址改不了」；更糟的是再点一次
+     保存会把默认值写回去，静默覆盖用户设置。
 
 用法：
   patch-src.py <src_dir>          # 就地修改 <src_dir>（构建时对副本执行）
@@ -72,6 +78,19 @@ PATCHES: dict[str, list[tuple[str, str, int]]] = {
         (
             '        Path("/opt/douyin-sparkflow/state"),',
             '        Path(os.getenv("SPARKFLOW_STATE_DIR") or "/opt/douyin-sparkflow/state"),',
+            1,
+        ),
+    ],
+    "webui/app.py": [
+        (
+            '        "login_desktop_public_port",\n'
+            '    )\n'
+            '    return {key: settings.get(key) for key in allowed_keys}',
+            '        "login_desktop_public_port",\n'
+            '        "douyin_network_mode",\n'
+            '        "douyin_proxy_url",\n'
+            '    )\n'
+            '    return {key: settings.get(key) for key in allowed_keys}',
             1,
         ),
     ],
