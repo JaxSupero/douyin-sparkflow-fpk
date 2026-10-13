@@ -57,14 +57,46 @@ jobs:
             "${{ steps.detect.outputs.date }}" \
             config/bootstrap/upstream.env manifest "$GITHUB_OUTPUT"
 
-      - name: Commit upstream pin and FPK version
+      - name: Generate Chinese user-facing changelog
+        id: changelog
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 上一个版本的 pin 就是本次 changelog 的区间起点；首次更新无上一版，
+          # 退化为「本次区间内全部提交」，由脚本自身按日期去重限流。
+          PREV_SHA="$(python3 - <<'PY'
+          import re, subprocess
+          # update-upstream.py 刚把新 SHA 写进了 upstream.env，这里从 git 取旧值
+          old = subprocess.run(["git", "show", "HEAD:config/bootstrap/upstream.env"],
+                               capture_output=True, text=True, check=True).stdout
+          m = re.search(r"^UPSTREAM_SHA=([0-9a-f]{40})$", old, re.M)
+          print(m.group(1) if m else "")
+          PY
+          )"
+          # 首次更新时 PREV_SHA 为空，gen-changelog.py 会自行退化为「上游最近 30 个提交」。
+          echo "changelog 区间: ${PREV_SHA:-<首次>}..${{ steps.detect.outputs.sha }}"
+          python3 scripts/gen-changelog.py \
+            ${PREV_SHA:+--prev-sha "$PREV_SHA"} \
+            --new-sha "${{ steps.detect.outputs.sha }}" \
+            --manifest manifest \
+            --out changelog.txt
+          {
+            echo "text<<CLGEOF"
+            cat changelog.txt
+            echo "CLGEOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "已生成 changelog.txt: $(wc -m < changelog.txt) 字符"
+
+      - name: Commit upstream pin, FPK version and changelog
         if: steps.bump.outputs.changed == 'true'
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add config/bootstrap/upstream.env manifest
-          git commit -m "chore: update upstream pin and bump FPK version"
+          git add config/bootstrap/upstream.env manifest changelog.txt
+          git commit -m "chore: update upstream pin, bump FPK version and refresh changelog"
           git push
 
       - name: Dispatch FPK build
