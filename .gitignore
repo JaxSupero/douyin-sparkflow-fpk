@@ -7,3 +7,7 @@ app/src/
 # Python artifacts
 __pycache__/
 *.py[cod]
+
+# gen-changelog.py 的本地调试残留（CI 生成的 changelog.txt 需要入库，不要忽略）
+changelog.*.tmp
+*.fpk.tmp

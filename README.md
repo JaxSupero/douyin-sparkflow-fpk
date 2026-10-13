@@ -53,6 +53,7 @@ douyin-sparkflow-fpk/
     ├── build-fpk.sh             # 同步源码 → 打补丁 → 权限/软链归一化 → fnpack build → 校验
     ├── patch-src.py             # fnOS 原生部署补丁（锚点不匹配即失败）
     ├── update-upstream.py       # CI 用：固定上游 SHA + 递增 manifest patch 版本
+    ├── gen-changelog.py         # CI 用：区间提交 → 中文用户向更新说明（写回 manifest）
     └── xkbcomp-shim.c           # LD_PRELOAD 垫片（Xvfb 找 /usr/bin/xkbcomp）
 ```
 
@@ -68,6 +69,36 @@ bash scripts/build-fpk.sh      # 产出 dist/*.fpk 并自检
 
 `build-fpk.sh` 内置校验：必备成员、`manifest.checksum` 与 `app.tgz` MD5 一致、
 关键文件存在、JSON 合法、`cmd/main` 执行位、补丁已生效。
+
+## 更新日志（changelog）
+
+`scripts/gen-changelog.py` 在每次自动更新时生成**中文用户向**更新说明，同时写入
+`manifest` 的 `changelog` 字段、`changelog.txt`，并成为 GitHub Release 的正文。
+
+为什么不直接用上游 `CHANGELOG.md`（实测数据）：
+
+| | 实测 |
+|---|---|
+| 上游 CHANGELOG 日期小节 | 5 个（05-30 / 07-11 / 08-25 / 08-27 / 10-13） |
+| 有提交但无对应小节的日期 | **34 个** |
+| 未被记录的提交 | **133/151 = 88%** |
+
+而且上游那 5 个小节是 Markdown 英文技术日志（含 webhook、锁文件一类的实现细节），
+`manifest` 的 `changelog` 是**单行 INI 值**，官方要求「简洁、面向用户表达」。
+
+因此生成策略是：
+
+1. 取 `config/bootstrap/upstream.env` 里上一个 pin 与本次 pin 之间的 commit
+   （首次运行时退化为上游最近 30 个提交）；
+2. 按 conventional commits 分类：`fix → 修复`、`feat → 新增`、`perf → 优化`，
+   `docs` / `test` / `ci` / `chore` / `refactor` 直接丢弃（用户无感）；
+3. 用项目领域词表把英文 subject 中文化；**命中不了的整条丢弃**——
+   宁可少写一条，也不在应用中心输出半中半英的说明；
+4. 上游 CHANGELOG 只用于校验「本次区间确有手写摘要」，不作为文案来源；
+5. 同类型最多 4 条、总计 8 条、整段上限 420 字符。
+
+词表与整句映射在 `scripts/gen-changelog.py` 的 `VOCAB` / `_PHRASE` 里，
+新增上游高频词时按需补充。
 
 ## 自动跟踪上游与 GitHub Actions
 
