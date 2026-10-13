@@ -193,6 +193,30 @@ jobs:
           echo "fpk=$TARGET" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
+      - name: Load changelog for release notes
+        id: cl
+        run: |
+          set -euo pipefail
+          # auto-update.yml 生成的 changelog.txt 与 manifest 同步落盘；
+          # 手动触发构建时可能还没有该文件，此时回落到 manifest 里的字段。
+          if [ -f changelog.txt ]; then
+            TEXT="$(tr '\n' ' ' < changelog.txt | sed 's/[[:space:]]*$//')"
+            SRC="changelog.txt"
+          else
+            TEXT="$(awk -F= '/^changelog[[:space:]]*=/ {sub(/^[^=]*=[[:space:]]*/,""); print; exit}' manifest | tr -d '\r')"
+            SRC="manifest:changelog"
+          fi
+          if [ -z "$TEXT" ]; then
+            TEXT="（本次构建未生成更新说明）"
+          fi
+          {
+            echo "text<<CLGEOF"
+            echo "$TEXT"
+            echo "CLGEOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "release notes 来源: $SRC（${#TEXT} 字符）"
+          echo "$TEXT"
+
       - name: Build Summary
         run: |
           {
@@ -230,6 +254,11 @@ jobs:
             抖音 SparkFlow for fnOS（原生部署，非 Docker）— 自动构建
             - FPK version: `${{ steps.build.outputs.version }}`
             - Upstream commit: `${{ steps.upstream.outputs.sha || 'main HEAD' }}`
+
+            **更新说明**
+
+            ${{ steps.cl.outputs.text }}
+
             下载 `fnos-douyin_sparkflow.fpk` 获取滚动版。
 
       - name: Publish versioned release
@@ -248,7 +277,13 @@ jobs:
             - FPK version: `${{ steps.build.outputs.version }}`
             - Upstream commit: `${{ steps.upstream.outputs.sha || 'main HEAD' }}`
             - Upstream date: `${{ steps.upstream.outputs.date || '-' }}`
-            - 仅支持 x86_64；上游许可仅限非商业用途。
+
+            **更新说明**
+
+            ${{ steps.cl.outputs.text }}
+
+            ---
+            仅支持 x86_64；上游许可仅限非商业用途。
 
       - name: Cache cleanup
         if: always()
