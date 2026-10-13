@@ -1,1 +1,1 @@
-新增：新增运行失败提醒与每日汇总推送到 IM 机器人。
+更换应用发布者为 JaxSupero（https://github.com/JaxSupero/douyin-sparkflow-fpk）；功能与上一版一致，无使用变化。
