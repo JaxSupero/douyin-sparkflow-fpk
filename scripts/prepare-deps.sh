@@ -373,9 +373,15 @@ else
       continue
     fi
     ldd_out="$CACHE/ldd-out.txt"
+    # ldd 只适用于动态链接的 ELF。有些随包目标是 shell 脚本包装器
+    # （如 Debian xserver-xdummy 提供的 Xdummy），对它们 ldd 恒返回非 0，
+    # 这不代表缺库。先判定 ELF magic，非 ELF 直接跳过校验。
+    if [ "$(head -c 4 "$bp" | od -An -t x1 | tr -d ' \n')" != "7f454c46" ]; then
+      echo "  - $(basename "$bp"): 非 ELF（包装脚本/数据文件），跳过 ldd 校验"
+      continue
+    fi
     if ! env LD_LIBRARY_PATH="$LD_PATH" ldd "$bp" > "$ldd_out" 2>/dev/null; then
-      # ldd 本身失败（非常规 ELF / 解析器缺失等）。不静默放过，但与缺库区分开：
-      echo "  ! $(basename "$bp"): ldd 返回非 0（$(tr -d '\n' < "$ldd_out" | head -c 80)）"
+      echo "::error:: $(basename "$bp"): ldd 返回非 0（$(tr -d '\n' < "$ldd_out" | head -c 120)）" >&2
       PRUNE_FAIL=1
       continue
     fi

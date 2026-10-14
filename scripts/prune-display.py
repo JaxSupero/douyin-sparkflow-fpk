@@ -47,6 +47,19 @@ def ldd_paths(binary: Path, ld_path: str) -> tuple[list[str], list[str]]:
     return ok, bad
 
 
+def is_elf(path: Path) -> bool:
+    """只有动态链接 ELF 才值得跑 ldd。
+
+    Debian 的 xserver-xdummy 提供的 Xdummy 是 shell 脚本包装器，
+    对它跑 ldd 恒返回非 0；不先判 ELF 会把「不是 ELF」误报成「闭包失败」。
+    """
+    try:
+        with open(path, "rb") as f:
+            return f.read(4) == b"\x7fELF"
+    except OSError:
+        return False
+
+
 def compute_keep(stage: Path, bins: list[Path]) -> tuple[set[str], list[str], set[str]]:
     """返回 (保留的 .so 绝对路径集合, not found 列表, 解析到的 soname 集合)"""
     keep: set[str] = set()
@@ -60,6 +73,9 @@ def compute_keep(stage: Path, bins: list[Path]) -> tuple[set[str], list[str], se
         if rf in visited:
             continue
         visited.add(rf)
+        if not is_elf(f):
+            print(f"[skip] {f.name}: 非 ELF，不做 ldd 依赖分析", file=sys.stderr)
+            continue
         ok, bad = ldd_paths(f, f"{stage}/usr/lib/x86_64-linux-gnu:{stage}/usr/lib")
         missing.extend(bad)
         for p in ok:
