@@ -355,6 +355,11 @@ else
 
   # 硬门槛：裁剪后所有目标二进制必须零缺失库，否则视为残包直接失败。
   # 这是「闭包裁剪」唯一的正确性保证 —— 不能靠包体变小就认为成功。
+  #
+  # 注意 ldd 的退出码：目标不是动态链接、依赖解析失败等情况下 ldd 会返回非 0。
+  # 脚本整体是 `set -euo pipefail`，若把 ldd 直接放在命令替换里，非 0 会让
+  # 整段在赋值处静默中止（CI 上就是这样：前 4 个 ✓ 打完后直接退出，看不出原因）。
+  # 因此先落盘再过滤，并对 ldd 自身的失败单独处理。
   LD_PATH="$DIST/display/usr/lib/x86_64-linux-gnu:$DIST/display/usr/lib"
   PRUNE_FAIL=0
   for bin in "${PRUNE_BINS[@]}"; do
@@ -362,11 +367,21 @@ else
       /*) bp="$bin" ;;
       *)  bp="$DIST/display/usr/bin/$bin" ;;
     esac
-    [ -e "$bp" ] || { echo "::error:: 裁剪后目标缺失：$bp" >&2; PRUNE_FAIL=1; continue; }
-    missing="$(env LD_LIBRARY_PATH="$LD_PATH" ldd "$bp" 2>/dev/null \
-               | awk '/not found/ {print $1}' | tr '\n' ' ')"
+    if [ ! -e "$bp" ]; then
+      echo "::error:: 裁剪后目标缺失：$bp" >&2
+      PRUNE_FAIL=1
+      continue
+    fi
+    ldd_out="$CACHE/ldd-out.txt"
+    if ! env LD_LIBRARY_PATH="$LD_PATH" ldd "$bp" > "$ldd_out" 2>/dev/null; then
+      # ldd 本身失败（非常规 ELF / 解析器缺失等）。不静默放过，但与缺库区分开：
+      echo "  ! $(basename "$bp"): ldd 返回非 0（$(tr -d '\n' < "$ldd_out" | head -c 80)）"
+      PRUNE_FAIL=1
+      continue
+    fi
+    missing="$(awk '/not found/ {print $1}' "$ldd_out" | tr '\n' ' ')"
     if [ -n "$missing" ]; then
-      echo "::error:: $bin 缺库：$missing" >&2
+      echo "::error:: $(basename "$bp") 缺库：$missing" >&2
       PRUNE_FAIL=1
     else
       echo "  ✓ $(basename "$bp") 依赖完整"
