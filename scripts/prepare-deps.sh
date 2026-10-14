@@ -336,7 +336,11 @@ else
   cp -a "$DIST/display/usr" "$PRUNE_STAGE/"
   # 闭包目标：X/VNC 栈 + 完整 Chromium（headless_shell 已被删除）
   CHROME_BIN="$(find "$DIST/chrome" -maxdepth 3 -type f -path '*/chrome-linux/chrome' -print -quit 2>/dev/null || true)"
-  PRUNE_BINS=(Xvfb x11vnc fluxbox Xdummy xkbcomp)
+  # Xdummy 是 fnOS/小米系固件自带的虚拟 X 服务器，仅部分机型存在；
+  # 构建机（Debian/Ubuntu runner）没有它，而闭包里也不需要它，
+  # 因此只在目标机确实带上了才纳入闭包与硬门槛，否则会误报缺失。
+  PRUNE_BINS=(Xvfb x11vnc fluxbox xkbcomp)
+  [ -x "$DIST/display/usr/bin/Xdummy" ] && PRUNE_BINS+=(Xdummy)
   [ -n "$CHROME_BIN" ] && PRUNE_BINS+=("$CHROME_BIN")
   echo "按 ldd 闭包裁剪显示栈（目标：${PRUNE_BINS[*]}）"
   python3 "$ROOT/scripts/prune-display.py" "$PRUNE_STAGE" \
