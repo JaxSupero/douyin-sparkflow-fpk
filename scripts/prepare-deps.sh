@@ -228,6 +228,11 @@ APT_OPTS=(
   -o "Dir::Log=$APT_STATE/log"
   -o "APT::Sandbox::User=$APT_SANDBOX_USER"
   -o APT::Get::AllowUnauthenticated=false
+  # 索引与控制流同样要抗抖动：不加这两条时一次连接悬挂就会让整段卡住（
+  # 下载侧已有镜像回退，但 apt 解析索引是单镜像的，必须自带重试与超时）。
+  -o Acquire::Retries=5
+  -o Acquire::http::Timeout=30
+  -o Acquire::https::Timeout=30
 )
 APT_URI_OPTS=(-o APT::Get::Download-Only=true -o APT::Get::Print-URIs=true)
 
@@ -276,13 +281,112 @@ if [ "${FORCE_REBUILD_DEPS:-0}" = "1" ]; then
   DISPLAY_HAVE=""; FONT_HAVE=""
 fi
 
+# ─────────────────────────────────────────────────────────────
+# Debian .deb 下载：多镜像回退 + 快速失败 + 逐包完整性校验
+#
+# 为什么不用「单镜像 + curl 默认参数」：CI 实测 curl 连 ustc 镜像会卡在 TCP
+# 建连（每次约 135s，等于内核 SYN 重传耗尽 —— 是 SYN 被丢不是被拒），叠加
+# --retry 3 后每包要 ~9 分钟；191 个包必然撞穿 60 分钟的 job 上限（run #57
+# 就是这样跑到 60.2min 被 cancel 的）。同一台 runner 上 apt 走同一镜像却
+# 9 秒拉完 15.7MB，说明问题只在 curl 这一层的连接差异。
+#
+# 对策：强制 IPv4 + 短连接超时（坏镜像 20s 就放弃）+ 多镜像回退 +
+# dpkg-deb 结构校验（坏包换镜像重来）+ 连通性预检（诊断信息在开头就给全）。
+DEB_MIRROR_PAIRS=()
+deb_pair_add() {
+  local m="${1:-}" s="${2:-}" p
+  [ -n "$m" ] || return 0
+  for p in "${DEB_MIRROR_PAIRS[@]:-}"; do
+    [ "$p" = "$m|$s" ] && return 0
+  done
+  DEB_MIRROR_PAIRS+=("$m|$s")
+}
+deb_pair_add "$DEBIAN_MIRROR" "$DEBIAN_SECURITY_MIRROR"
+deb_pair_add "https://deb.debian.org/debian" "https://deb.debian.org/debian-security"
+deb_pair_add "https://mirrors.tuna.tsinghua.edu.cn/debian" "https://mirrors.tuna.tsinghua.edu.cn/debian-security"
+deb_pair_add "https://mirrors.aliyun.com/debian" "https://mirrors.aliyun.com/debian-security"
+
+CURL_DEB=(-fsSL -4 --connect-timeout 20 --max-time 300 --retry 2 --retry-delay 3 --retry-connrefused)
+
+deb_ok() { dpkg-deb --info "$1" >/dev/null 2>&1; }
+
+# 把「配置镜像」下的 URL 改写到第 i 组镜像；URL 不属于任何已配置镜像时输出空行
+deb_url_for_pair() {
+  local url="$1" i="$2" pair m s rel=""
+  pair="${DEB_MIRROR_PAIRS[$i]}"
+  m="${pair%%|*}"; s="${pair#*|}"
+  case "$url" in
+    "$DEBIAN_MIRROR"/*) rel="${url#"$DEBIAN_MIRROR"/}"; printf '%s\n' "$m/$rel" ;;
+    "$DEBIAN_SECURITY_MIRROR"/*) rel="${url#"$DEBIAN_SECURITY_MIRROR"/}"; printf '%s\n' "$s/$rel" ;;
+    *) printf '\n' ;;
+  esac
+}
+
+DEB_PAIR_HINT=0
+
+# 预检只用于排序与诊断，不做硬中止：HEAD 被拒的镜像未必不能 GET，
+# 真失败由 download_one 在秒级暴露（见下）。若镜像可达则把首次命中的
+# 那组设为偏好，后续 191 个包直接命中，不再逐个试探。
+probe_deb_mirrors() {
+  local url="$1" total=${#DEB_MIRROR_PAIRS[@]} i alt ok=0
+  echo "  镜像连通性预检（样本 $(basename "$url")）："
+  for i in $(seq 0 $((total - 1))); do
+    alt="$(deb_url_for_pair "$url" "$i")"
+    [ -n "$alt" ] || continue
+    if curl -fsSI -4 --connect-timeout 15 --max-time 30 -o /dev/null "$alt" 2>/dev/null; then
+      if [ "$ok" = 0 ]; then DEB_PAIR_HINT=$i; fi
+      ok=1
+      echo "    ✓ #$((i + 1)) ${DEB_MIRROR_PAIRS[$i]%%|*}"
+    else
+      echo "    ✗ #$((i + 1)) ${DEB_MIRROR_PAIRS[$i]%%|*}"
+    fi
+  done
+  if [ "$ok" = 0 ]; then
+    echo "::warning:: 预检未命中任何镜像，仍按偏好顺序实际下载（坏镜像 20s 即放弃）"
+  fi
+}
+
+# 单个包：从偏好镜像开始轮询，逐个校验；全失败才报错。
+# 最坏情况（网络全断）= 4 组镜像 × 3 次尝试 × 20s 连接超时 ≈ 4 分钟即失败，
+# 不会像以前那样静默地把 job 拖到 60 分钟上限。
+download_one() {
+  local url="$1" fn="$2" total=${#DEB_MIRROR_PAIRS[@]} k i alt
+  for k in $(seq 0 $((total - 1))); do
+    i=$(( (DEB_PAIR_HINT + k) % total ))
+    alt="$(deb_url_for_pair "$url" "$i")"
+    [ -n "$alt" ] || continue
+    if curl "${CURL_DEB[@]}" -o "$fn" "$alt" 2>/dev/null && deb_ok "$fn"; then
+      if [ "$i" != "$DEB_PAIR_HINT" ]; then
+        echo "  · 镜像切换 → #$((i + 1)) ${DEB_MIRROR_PAIRS[$i]%%|*}"
+      fi
+      DEB_PAIR_HINT=$i
+      return 0
+    fi
+    rm -f "$fn"
+  done
+  # 兜底：原 URL（可能不属于任何已配置镜像前缀）
+  if curl "${CURL_DEB[@]}" -o "$fn" "$url" 2>/dev/null && deb_ok "$fn"; then
+    return 0
+  fi
+  rm -f "$fn"
+  echo "::error:: 无法下载 $url（已轮询 $total 组镜像，连接与校验均失败）" >&2
+  return 1
+}
+
 download_debs() {
-  local list="$1"
-  local url fn
+  local list="$1" url fn n=0 total
+  total="$(wc -l < "$list")"
+  probe_deb_mirrors "$(head -n 1 "$list")"
   while read -r url; do
+    [ -n "$url" ] || continue
+    n=$((n + 1))
     fn="$DEBS/$(basename "$url")"
-    [ -f "$fn" ] || curl -fsSL --retry 3 --retry-delay 5 --max-time 300 -o "$fn" "$url"
+    if [ -f "$fn" ] && deb_ok "$fn"; then continue; fi
+    rm -f "$fn"
+    download_one "$url" "$fn" || return 1
+    if [ $((n % 25)) = 0 ]; then echo "  已下载 $n/$total ..."; fi
   done < "$list"
+  echo "  下载完成 $n/$total（当前镜像 #$((DEB_PAIR_HINT + 1)) ${DEB_MIRROR_PAIRS[$DEB_PAIR_HINT]%%|*}）"
 }
 
 extract_debs() {
