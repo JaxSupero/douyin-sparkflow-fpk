@@ -17,6 +17,12 @@
      POST /settings 都在用它们：保存其实已落盘，但页面永远回显默认值，
      用户看到的现象是「网络出口/Mihomo 代理地址改不了」；更糟的是再点一次
      保存会把默认值写回去，静默覆盖用户设置。
+5. core/browser.py
+   - launch/launch_persistent_context 显式加 channel="chromium"。
+     Playwright 1.49+ 的 headless=True 默认走 chromium_headless_shell 二进制；
+     FPK 为省 323 MiB 已删除该副本（完整 Chromium 自带 libvk_swiftshader，
+     无头渲染不受影响），不加 channel 会直接报 "Executable doesn't exist"。
+     只在 headless 时指定，有头登录桌面走完整 Chromium 本来就无需该参数。
 
 用法：
   patch-src.py <src_dir>          # 就地修改 <src_dir>（构建时对副本执行）
@@ -91,6 +97,42 @@ PATCHES: dict[str, list[tuple[str, str, int]]] = {
             '        "douyin_proxy_url",\n'
             '    )\n'
             '    return {key: settings.get(key) for key in allowed_keys}',
+            1,
+        ),
+    ],
+    "core/browser.py": [
+        (
+            'def _browser_launch_options(GUI=False, network_mode=None):\n'
+            '    args = _browser_args()\n'
+            '    proxy = _douyin_browser_proxy(network_mode=network_mode)\n'
+            '    if proxy:\n'
+            '        return {\n'
+            '            "headless": _headless_for(GUI),\n'
+            '            "args": args,\n'
+            '            "proxy": {"server": proxy},\n'
+            '        }\n'
+            '    args.append("--no-proxy-server")\n'
+            '    return {\n'
+            '        "headless": _headless_for(GUI),\n'
+            '        "args": args,\n'
+            '    }\n',
+            'def _browser_launch_options(GUI=False, network_mode=None):\n'
+            '    args = _browser_args()\n'
+            '    proxy = _douyin_browser_proxy(network_mode=network_mode)\n'
+            '    # fnOS FPK 精简包删掉了 chromium_headless_shell（省约 323 MiB）。\n'
+            '    # Playwright 1.49+ 的 headless=True 默认去启动那个二进制，删掉后会\n'
+            '    # 报 "Executable doesn\'t exist"。channel="chromium" 让无头模式改用\n'
+            '    # 完整 Chromium；它自带 libvk_swiftshader 做软件光栅化，无需 headless_shell。\n'
+            '    # 有头（登录桌面）本来就用完整 Chromium，不受影响。\n'
+            '    headless = _headless_for(GUI)\n'
+            '    options = {"headless": headless, "args": args}\n'
+            '    if headless:\n'
+            '        options["channel"] = "chromium"\n'
+            '    if proxy:\n'
+            '        options["proxy"] = {"server": proxy}\n'
+            '    else:\n'
+            '        args.append("--no-proxy-server")\n'
+            '    return options\n',
             1,
         ),
     ],

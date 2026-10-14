@@ -135,10 +135,24 @@ else
   PLAYWRIGHT_BROWSERS_PATH="$DIST/chrome" PLAYWRIGHT_DOWNLOAD_HOST="$PW_HOST" \
     "$PW_VENV/bin/playwright" install chromium
   rm -rf "$DIST/chrome/.links"
-  printf '%s\n' "$PW_VER" > "$CHROME_STAMP"
   CHROME_CACHE_OK=1
-  du -sh "$DIST/chrome"
 fi
+
+# 方案 A：删掉 chromium_headless_shell（实测 323 MiB，占 chrome 目录 35%）。
+# Playwright 1.49+ 的 headless=True 默认走 headless_shell 二进制，删掉后必须让
+# launch 走 channel="chromium" 回退到完整 Chromium —— 这一改动由 patch-src.py
+# 给 core/browser.py 的 _browser_launch_options 加上 channel 实现。
+# 完整 Chromium 自带 libvk_swiftshader，无头渲染不依赖 headless_shell。
+# 实测：删掉后 channel="chromium" + headless=True 能正常启动并访问目标站点。
+# 保留开关：KEEP_HEADLESS_SHELL=1（排查浏览器问题时临时用）。
+if [ "${KEEP_HEADLESS_SHELL:-0}" != "1" ]; then
+  rm -rf "${DIST:?}"/chrome/chromium_headless_shell-*
+  echo "已移除 chromium_headless_shell（无头任务改走完整 Chromium）"
+else
+  echo "KEEP_HEADLESS_SHELL=1：保留 headless_shell"
+fi
+printf '%s\n' "$PW_VER" > "$CHROME_STAMP"
+du -sh "$DIST/chrome"
 
 # X 显示栈：按指纹复用；缓存未命中时从固定 Debian bookworm 源解析并打包。
 log "4/7 X 显示栈（Xvfb / x11vnc / fluxbox，Debian ${DEBIAN_SUITE} 固定包集）"
@@ -306,6 +320,59 @@ else
   [ -x "$DIST/display/usr/bin/Xvfb" ] || { echo "::error:: Xvfb 未就位" >&2; exit 1; }
   [ -x "$DIST/display/usr/bin/xkbcomp" ] || { echo "::error:: xkbcomp 未就位（Xvfb 必需）" >&2; exit 1; }
   mkdir -p "$DIST/display/fonts"
+
+  # 方案 B：按 ldd 精确闭包裁剪共享库（实测 913M → 108M，省约 805 MiB）。
+  #
+  # 为什么必须裁剪而不能只靠 apt 包白名单：xvfb/x11vnc/fluxbox 的传递依赖会
+  # 把整条 Mesa GPU 栈拖进来 —— dri/ 驱动 320M + libLLVM-15 224M（软链物化出
+  # 两份实体）+ libicu72 60M + libz3/libgs/libx265 等，合计约 805 MiB，
+  # 而 X/VNC 与 Chromium 的 ldd 闭包从未加载其中任何一个。
+  # Chromium 自带 libvk_swiftshader 做软件光栅化，不需要 llvmpipe。
+  #
+  # 保留 non-.so 内容（X11 xkb 数据、fluxbox 配置、字体索引等），只裁 .so；
+  # dri/ 子目录除非被闭包命中否则整目录删除。
+  PRUNE_STAGE="$CACHE/display-prune"
+  rm -rf "$PRUNE_STAGE"; mkdir -p "$PRUNE_STAGE"
+  cp -a "$DIST/display/usr" "$PRUNE_STAGE/"
+  # 闭包目标：X/VNC 栈 + 完整 Chromium（headless_shell 已被删除）
+  CHROME_BIN="$(find "$DIST/chrome" -maxdepth 3 -type f -path '*/chrome-linux/chrome' -print -quit 2>/dev/null || true)"
+  PRUNE_BINS=(Xvfb x11vnc fluxbox Xdummy xkbcomp)
+  [ -n "$CHROME_BIN" ] && PRUNE_BINS+=("$CHROME_BIN")
+  echo "按 ldd 闭包裁剪显示栈（目标：${PRUNE_BINS[*]}）"
+  python3 "$ROOT/scripts/prune-display.py" "$PRUNE_STAGE" \
+    --bins "${PRUNE_BINS[@]}" \
+    --report "$DIST/display/.closure-sonames" \
+    || { echo "::error:: 显示栈闭包裁剪失败" >&2; exit 1; }
+  [ -d "$DIST/display/fonts" ] || mkdir -p "$DIST/display/fonts"
+  rm -rf "$DIST/display/usr"
+  cp -a "$PRUNE_STAGE/usr" "$DIST/display/"
+  rm -rf "$PRUNE_STAGE"
+  [ -x "$DIST/display/usr/bin/Xvfb" ] || { echo "::error:: 裁剪后 Xvfb 丢失" >&2; exit 1; }
+
+  # 硬门槛：裁剪后所有目标二进制必须零缺失库，否则视为残包直接失败。
+  # 这是「闭包裁剪」唯一的正确性保证 —— 不能靠包体变小就认为成功。
+  LD_PATH="$DIST/display/usr/lib/x86_64-linux-gnu:$DIST/display/usr/lib"
+  PRUNE_FAIL=0
+  for bin in "${PRUNE_BINS[@]}"; do
+    case "$bin" in
+      /*) bp="$bin" ;;
+      *)  bp="$DIST/display/usr/bin/$bin" ;;
+    esac
+    [ -e "$bp" ] || { echo "::error:: 裁剪后目标缺失：$bp" >&2; PRUNE_FAIL=1; continue; }
+    missing="$(env LD_LIBRARY_PATH="$LD_PATH" ldd "$bp" 2>/dev/null \
+               | awk '/not found/ {print $1}' | tr '\n' ' ')"
+    if [ -n "$missing" ]; then
+      echo "::error:: $bin 缺库：$missing" >&2
+      PRUNE_FAIL=1
+    else
+      echo "  ✓ $(basename "$bp") 依赖完整"
+    fi
+  done
+  if [ "$PRUNE_FAIL" != "0" ]; then
+    echo "::error:: 显示栈裁剪后存在缺失依赖，构建中止（拒绝打出装不起来的包）" >&2
+    exit 1
+  fi
+  echo "显示栈裁剪后：$(du -sh "$DIST/display" | cut -f1)"
   printf '%s\n' "$DISPLAY_WANT" > "$DISPLAY_STAMP"
 fi
 

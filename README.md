@@ -6,7 +6,7 @@
 ## 交付物
 
 ```text
-dist/fnos-douyin_sparkflow_v<version>.fpk      # v1.1.1 实测 744,824,439 B（≈711 MiB）
+dist/fnos-douyin_sparkflow_v<version>.fpk      # v1.1.6 实测 337,274,011 B（≈322 MiB）
 dist/fnos-douyin_sparkflow_v<version>.fpk.sha256
 ```
 
@@ -22,13 +22,34 @@ CI 里用 tar+gzip 兜底构建时带 `--mtime='@0'`，才是可复现的。需�
 | 运行时 | `install_dep_apps=python312:nodejs_v24`（应用中心自动安装） |
 | Python 依赖 | uv 交叉安装 manylinux2014_x86_64 轮子（含 websockify），预置在 `app/dist/deps` |
 | 虚拟环境 | 启动时按需物化轻量 venv（符号链接 + `pyvenv.cfg`），依赖指纹变化才重建 |
-| 浏览器 | Playwright Chromium 1194 预置在 `app/dist/chrome`（跟随上游 requirements 锁定版本） |
+| 浏览器 | Playwright Chromium 1194 预置在 `app/dist/chrome`（跟随上游 requirements 锁定版本）；**只保留完整 Chromium**，无头任务经 `channel="chromium"` 复用它（`patch-src.py` 注入） |
 | 登录桌面 | Xvfb + fluxbox + x11vnc + websockify/noVNC，全部随包（`app/dist/display`、`app/dist/novnc`） |
 | 字体 | 文泉驿微米黑/正黑 + Noto Color Emoji，随包 |
 | 调度器 | 内置 `cron_runner.py` 轮询数据目录 spool（**不写系统 crontab**） |
-| 源码补丁 | 3 个文件 9 处环境变量开关，默认值不变，锚点严格校验 |
+| 源码补丁 | 5 个文件 11 处（环境变量开关 + Chromium channel），默认值不变，锚点严格校验 |
+| 显示栈裁剪 | 按 ldd 精确闭包只保留实际加载的 110 个 `.so`；未加载的 Mesa 驱动/LLVM/ICU 一律不带（`prune-display.py`，构建后以 `ldd` 零缺失为硬门槛） |
 
 安装/升级**不联网、不构建镜像**：依赖与浏览器全部在包内，`bootstrap.py` 首次启动时物化环境。
+
+## 包体积
+
+| 版本 | 体积 | 说明 |
+| --- | --- | --- |
+| v1.1.5 | 744,912,218 B（710.4 MiB） | 精简前 |
+| v1.1.6 | 337,274,011 B（321.6 MiB） | **-54.7%**，功能不变 |
+
+两处缩减，均已实测（无头任务、noVNC 扫码登录、中文/Emoji 渲染逐项验证通过）：
+
+- **-323 MiB**：不再打包 `chromium_headless_shell`。Playwright 1.49+ 的
+  `headless=True` 默认启动该二进制，删掉后由 `patch-src.py` 给启动参数注入
+  `channel="chromium"`，无头任务改用完整 Chromium（自带 SwiftShader 软件光栅化）。
+- **-805 MiB**：`dist/display` 按 ldd 精确闭包裁剪（913 MB → 108 MB）。
+  X/VNC 与 Chromium 实际只加载 110 个共享库；原包被传递依赖拖入的
+  Mesa GPU 驱动（`dri/` 320 MB）、`libLLVM-15`（224 MB）、`libicu72`、
+  `libz3`/`libgs`/`libx265` 等从未被加载，一并移除。
+  裁剪后构建脚本以 **`ldd` 零缺失为硬门槛**，缺一个库即中止出包。
+
+> `KEEP_HEADLESS_SHELL=1 scripts/prepare-deps.sh` 可临时保留 headless_shell（排查浏览器问题用）。
 
 ## 目录结构
 
@@ -43,13 +64,14 @@ douyin-sparkflow-fpk/
 ├── app/
 │   ├── src/                     # 上游源码（构建时同步 + 打补丁）
 │   ├── scripts/                 # 运行时脚本：bootstrap.py、login_stack.sh、web.sh、scheduler.sh、common.sh
-│   ├── dist/deps/               # Python 3.12 依赖（235 MB）
-│   ├── dist/chrome/             # Playwright Chromium（924 MB）
-│   ├── dist/display/            # X/VNC 组件 + 字体 + xkbcomp 垫片（652 MB）
+│   ├── dist/deps/               # Python 3.12 依赖（233 MB）
+│   ├── dist/chrome/             # Playwright Chromium 完整版（602 MB，不含 headless_shell）
+│   ├── dist/display/            # X/VNC 组件 + 字体 + xkbcomp 垫片（142 MB，已按闭包裁剪）
 │   ├── dist/novnc/              # noVNC 1.5.0 静态资源
 │   └── ui/                      # 桌面入口（8787 端口）
 └── scripts/
     ├── prepare-deps.sh          # 下载并准备全部离线依赖（构建机执行一次）
+    ├── prune-display.py         # 按 ldd 精确闭包裁剪显示栈共享库（构建硬门槛：零缺失）
     ├── build-fpk.sh             # 同步源码 → 打补丁 → 权限/软链归一化 → fnpack build → 校验
     ├── patch-src.py             # fnOS 原生部署补丁（锚点不匹配即失败）
     ├── update-upstream.py       # CI 用：固定上游 SHA + 递增 manifest patch 版本
