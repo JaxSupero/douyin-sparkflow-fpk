@@ -33,12 +33,25 @@ jobs:
         id: detect
         env:
           UPSTREAM_REPO: halfwaystudent/douyin-sparkflow
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           API="https://api.github.com/repos/${UPSTREAM_REPO}"
-          LATEST_JSON="$(curl --retry 3 --retry-delay 5 --retry-all-errors -fsSL --max-time 60 "${API}/commits/main")"
-          LATEST_SHA="$(printf '%s' "$LATEST_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])')"
-          LATEST_DATE="$(printf '%s' "$LATEST_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["commit"]["committer"]["date"][:10])')"
+          LATEST_JSON=""; LATEST_SHA=""; LATEST_DATE=""
+          # 必须带 token：匿名调 api.github.com 会被按 IP 限流成 403，
+          # 本工作流曾连续失败在 4 个 "curl: (22) ... 403" 上。
+          if LATEST_JSON="$(curl --retry 3 --retry-delay 5 --retry-all-errors -fsSL --max-time 60 \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                "${API}/commits/main")"; then
+            LATEST_SHA="$(printf '%s' "$LATEST_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])')"
+            LATEST_DATE="$(printf '%s' "$LATEST_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["commit"]["committer"]["date"][:10])')"
+          else
+            # 兜底：git ls-remote 单请求、不受 API 限流；拿不到提交日期就记当天。
+            echo "::warning:: GitHub API 不可用，回退 git ls-remote"
+            LATEST_SHA="$(git ls-remote "https://github.com/${UPSTREAM_REPO}.git" refs/heads/main | awk '{print $1}')"
+            LATEST_DATE="$(date -u +%F)"
+          fi
           [[ "$LATEST_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error:: invalid upstream SHA"; exit 1; }
           PROBE="$(mktemp -d)"
           trap 'rm -rf "$PROBE"' EXIT
