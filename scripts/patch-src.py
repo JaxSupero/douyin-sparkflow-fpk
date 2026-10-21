@@ -65,7 +65,7 @@ PATCHES: dict[str, list[tuple[str, str, int]]] = {
         (
             "running_in_container() and HOST_CRONTAB_PATH",
             "host_spool_enabled() and HOST_CRONTAB_PATH",
-            4,
+            5,
         ),
         (
             'CRON_LOG_PATH = "/app/logs/douyin-sparkflow.log"',
