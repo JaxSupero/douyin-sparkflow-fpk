@@ -71,24 +71,61 @@ jobs:
           set -euo pipefail
           # changelog.txt 原先只在 auto-update.yml 里生成：上游不动（我们手工
           # 发版修打包问题）时它一直是上一版的内容，manifest 里那行也同样陈旧。
-          # 这里判断 changelog.txt 是否需要按本仓库提交重建 —— 必须放在打包之前，
+          # 这里判断 changelog.txt 是否需要重建 —— 必须放在打包之前，
           # manifest 的 changelog 是要进包、由应用中心展示的那一行。
           #
-          # 判据用「最后改动这两个文件的提交哈希」而不是时间戳：
-          # 时间戳会被同一秒内的两次提交骗过（实测 bump manifest 与上一个
-          # changelog 提交落在同一秒时，被判成「已最新」而跳过重建）。
-          # auto-update.yml 是 manifest 与 changelog.txt 一起提交的，两者哈希
-          # 相同即为同步；不同就说明 manifest 被单独改过，需要重建。
+          # 触发重建的三种情况：
+          #  a) 文件不存在；
+          #  b) 与 manifest 不同源（manifest 被单独改过）。判据用「最后改动这两个
+          #     文件的提交哈希」而不是时间戳 —— 时间戳会被同一秒内的两次提交骗过
+          #     （实测 bump manifest 与上一个 changelog 提交落在同一秒时被判成
+          #     「已最新」而跳过）；auto-update 是两者一起提交的，哈希相同即同步；
+          #  c) 内容是旧版生成器的降级占位「跟随上游更新（<sha>）」。这种情况
+          #     两个文件往往**同源**（旧生成器一次写了两处），只靠 (b) 永远发现
+          #     不了 —— 实测 v1.1.10~v1.1.12 三次发布都原样带着这句话发出去。
           MANIFEST_C="$(git log -1 --format=%H -- manifest 2>/dev/null || true)"
           CHANGELOG_C="$(git log -1 --format=%H -- changelog.txt 2>/dev/null || true)"
           # bash 不允许 ${var:0:7:-默认} 这种把子串和默认值混用的写法
           # （报 bad substitution），所以先各自算好短哈希。
           M7="${MANIFEST_C:0:7}"; M7="${M7:-无}"
           C7="${CHANGELOG_C:0:7}"; C7="${C7:-无}"
-          if [ -f changelog.txt ] && [ -n "$MANIFEST_C" ] && [ "$MANIFEST_C" = "$CHANGELOG_C" ]; then
-            echo "changelog.txt 与 manifest 同源于 ${M7}，跳过"
+
+          DEGRADED=0
+          if grep -q '跟随上游更新' changelog.txt manifest 2>/dev/null; then
+            DEGRADED=1
+          fi
+
+          if [ -f changelog.txt ] && [ -n "$MANIFEST_C" ] && [ "$MANIFEST_C" = "$CHANGELOG_C" ] \
+             && [ "$DEGRADED" = "0" ]; then
+            echo "changelog.txt 与 manifest 同源于 ${M7} 且无旧占位文案，跳过"
+            exit 0
+          fi
+
+          if [ "$DEGRADED" = "1" ]; then
+            echo "检测到旧版降级文案「跟随上游更新」，按上游区间重写"
+            NEW_PIN="$(awk -F= '$1=="UPSTREAM_SHA"{print $2}' config/bootstrap/upstream.env 2>/dev/null || true)"
+            # 上一个 pin：upstream.env 的历史里倒数第二个改动它的提交
+            PREV_C="$(git log -2 --format=%H -- config/bootstrap/upstream.env 2>/dev/null | tail -1 || true)"
+            PREV_PIN=""
+            if [ -n "$PREV_C" ]; then
+              PREV_PIN="$(git show "${PREV_C}:config/bootstrap/upstream.env" 2>/dev/null \
+                          | awk -F= '$1=="UPSTREAM_SHA"{print $2}' || true)"
+            fi
+            if [ -n "$NEW_PIN" ] && [ -n "$PREV_PIN" ] && [ "$NEW_PIN" != "$PREV_PIN" ]; then
+              echo "上游区间 ${PREV_PIN:0:7}..${NEW_PIN:0:7}"
+              # 取不到上游数据（限流/网络）时不能就此放过 —— 那样坏文案会照旧
+              # 发出去。退回只写打包侧，至少不再出现「跟随上游更新（hash）」。
+              if ! python3 scripts/gen-changelog.py --prev-sha "$PREV_PIN" --new-sha "$NEW_PIN" \
+                     --manifest manifest --out changelog.txt; then
+                echo "::warning::上游区间生成失败（限流或网络），退回只写打包侧"
+                python3 scripts/gen-changelog.py --own-only --manifest manifest --out changelog.txt
+              fi
+            else
+              echo "拿不到有效上游区间，退回只写打包侧"
+              python3 scripts/gen-changelog.py --own-only --manifest manifest --out changelog.txt
+            fi
           else
-            echo "changelog.txt 与 manifest 不同源（${C7} vs ${M7}），重新生成"
+            echo "changelog.txt 与 manifest 不同源（${C7} vs ${M7}），按打包侧改动重建"
             python3 scripts/gen-changelog.py --own-only \
               --manifest manifest --out changelog.txt
           fi
