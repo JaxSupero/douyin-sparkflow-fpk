@@ -2,22 +2,38 @@
 """
 生成「中文用户向」更新日志，供 manifest / GitHub Release / FnDepot 索引共用。
 
-为什么不能直接搬上游 CHANGELOG（实测数据）：
-  上游 CHANGELOG.md 只有 5 个日期小节，而 main 有 34 个日期有提交，
-  151 条提交里 133 条（88%）没有对应条目；并且它是 Markdown 英文技术日志，
-  而 manifest 的 changelog 是**单行 INI 值**，官方要求「简洁、面向用户」。
+## 三个来源（不再局限于跟随上游）
 
-因此策略是双源 + 优先级：
-  1. 上游 CHANGELOG 里落在 [上次 pin, 本次 pin] 日期区间内的小节 → 取首条，人工摘要过
-     的信息量最高，但区间常常对不上（实测 1.1.0→1.1.1 只有 1 个提交，日期落在两小节之间）；
-  2. 区间内的 git commit（conventional commits）→ 映射成中文用户向条目；
-  3. 都没有 → 兜底「跟随上游更新（<短 SHA>）」。
+  1. **上游代码改动** —— 只算「对原生 FPK 有影响」的那部分。
+     上游是 Docker 项目，`docker-compose.yml` / `.env.example` / `tests/` /
+     `.github/` / `*.md` 的改动装进我们这套原生包后**一行都不会生效**。
+     实测 1.1.8→1.1.9 整个区间只有 4 个文件改动，全部属于这一类，
+     旧版脚本仍渲染成「跟随上游更新（9a4d72b）」，等于向用户报告了一件
+     根本没发生的事。
+  2. **本仓库打包改动** —— 我们自己的 patch、依赖、瘦身、生命周期脚本变更。
+     这些恰恰是用户装新包后能感知的差异，旧版脚本完全没纳入。
+  3. 上游 CHANGELOG.md 的日期小节 —— 仅作「确有功能更新」的旁证，不取文案
+     （原文是英文技术日志，与 manifest 要求的「简洁、面向用户」不符）。
+
+## 为什么不用机器翻译
+
+  实测把 "treat a refused browser send as a failure" 机翻成「将浏览器发送视为失败」
+  这类不可读的中文，因此维护一张只覆盖本项目高频关键词的词表 VOCAB；
+  命中不了的整条**保留英文原文**（宁可英文也不要错译的假中文）。
+  中文提交（我们自己的改动）直接原样通过。
+
+## 两种长度
+
+  * `--out`      → 完整版，给 Release 正文 / FnDepot 索引看，上限 FULL_LEN
+  * `--manifest` → 压缩版，manifest 的 changelog 是单行 INI 值，上限 MAX_LEN
 
 用法:
     python3 gen-changelog.py --repo halfwaystudent/douyin-sparkflow \
-        --prev-sha <40hex> --new-sha <40hex> --manifest manifest --out changelog.txt
+        --prev-sha <40hex> --new-sha <40hex> \
+        --manifest manifest --out changelog.txt
 
-    # 本地/CI 都能跑；--offline-cache 可复用上次抓到的 JSON，避免重复打 API
+    # --own-since 不传时自动推断为「上一次自动发布的提交」，
+    # 即在那个提交与 HEAD 之间查找我们自己的打包改动。
 环境变量:
     GITHUB_TOKEN   可选，提高 API 限额
 """
@@ -27,9 +43,11 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -49,6 +67,34 @@ MAX_TOTAL = 8
 
 # manifest 的 changelog 是单行 INI 值，长度上限按应用中心能正常展示来定
 MAX_LEN = 420
+# Release 正文 / FnDepot 索引可以更长
+FULL_LEN = 1200
+# 打包侧最多列几条：列全了会变成开发流水账，用户只需要知道最要紧的几处
+MAX_OWN = 4
+
+# ── 对原生 FPK 无影响的路径 ──────────────────────────────────────────
+# 上游用 Docker 交付，这些文件在我们的原生包里根本不参与运行。
+# 命中全部文件才判定为「无关」：只要有一个文件落在别的路径上就算有关。
+IRRELEVANT_PATH_RE = re.compile(
+    r"(?ix)^(?:"
+    # 容器 / 环境变量：原生包完全不读
+    r"docker-compose[^/]*\.ya?ml"
+    r"|dockerfile[^/]*"
+    r"|\.dockerignore"
+    r"|\.env(?:\.[^/]+)?"
+    # CI 与测试：进不了包
+    r"|\.github/.*"
+    r"|(?:[^/]+/)*(?:tests?|__tests__)/.*"
+    r"|(?:[^/]+/)*conftest\.py"
+    r"|(?:[^/]+/)*test_[^/]*\.py"
+    r"|(?:[^/]+/)*[^/]*_test\.py"
+    # 文档与仓库杂项
+    r"|(?:[^/]+/)*docs?/.*"
+    r"|[^/]*\.md"
+    r"|\.gitignore"
+    r"|license[^/]*"
+    r")$"
+)
 
 
 def api(url: str, attempts: int = 6) -> object:
@@ -58,6 +104,9 @@ def api(url: str, attempts: int = 6) -> object:
     必须处理 IncompleteRead：上游 compare 30 个提交时响应超过 600 KB，
     分块传输会在流末被掐断（实测 "626114 bytes read, 16674 more expected"），
     这是传输层失败而非内容差异，退避后重试即可 —— 直接放弃会让整个构建中断。
+
+    但 4xx 是**确定性**失败，重试只会把一条明确的错误拖成 60 秒的静默等待
+    （实测 SHA 写错时 6 次退避后才报 404）。401/403/404/422 立即抛出。
     """
     last = None
     for attempt in range(attempts):
@@ -67,8 +116,7 @@ def api(url: str, attempts: int = 6) -> object:
                 headers={
                     "Accept": "application/vnd.github+json",
                     "User-Agent": "fnos-fpk-changelog",
-                    **({"Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}"}
-                       if os.environ.get("GITHUB_TOKEN") else {}),
+                    **(gh_auth(url)),
                 },
             )
             with urllib.request.urlopen(req, timeout=90) as resp:
@@ -80,13 +128,40 @@ def api(url: str, attempts: int = 6) -> object:
                         break
                     chunks.append(chunk)
             return json.loads(b"".join(chunks).decode("utf-8"))
-        except Exception as exc:  # noqa: BLE001 - 统一重试
+        except urllib.error.HTTPError as exc:
+            if exc.code in (400, 401, 403, 404, 422):
+                hint = {
+                    401: "凭据无效（token 过期或被撤销）",
+                    403: "匿名配额耗尽或被拒",
+                    404: "SHA 不存在，或不在该仓库",
+                }.get(exc.code, "请求被拒")
+                raise RuntimeError(f"GitHub API {exc.code}: {hint}: {url}") from exc
+            last = exc
+            wait = min(2 ** attempt, 30)
+            print(f"  [重试 {attempt + 1}/{attempts}] HTTP {exc.code}，{wait}s 后再试",
+                  file=sys.stderr)
+            time.sleep(wait)
+        except Exception as exc:  # noqa: BLE001 - 传输层失败统一重试
             last = exc
             wait = min(2 ** attempt, 30)
             print(f"  [重试 {attempt + 1}/{attempts}] {type(exc).__name__}，{wait}s 后再试",
                   file=sys.stderr)
             time.sleep(wait)
     raise RuntimeError(f"GitHub API 重试 {attempts} 次仍失败: {url}: {last}")
+
+
+def gh_auth(url: str) -> dict:
+    """
+    只对 api.github.com 带 token。
+
+    实测：release 资产 URL 会 302 到带签名的 release-assets CDN，
+    把 API 凭据一起带过去会被判 401（两套凭据冲突）。
+    """
+    tok = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if not tok:
+        return {}
+    host = urllib.parse.urlsplit(url).hostname or ""
+    return {"Authorization": f"Bearer {tok}"} if host == "api.github.com" else {}
 
 
 def split_conventional(message: str):
@@ -188,9 +263,9 @@ _PHRASE = {
 _KEEP_LATIN = {"telegram", "webhook", "douyin", "sparkflow", "xkb", "noVNC", "ID", "URL"}
 
 
-def _tokenize(text: str):
-    """按非字母数字（连字符保留）切词，并映射为 (原形, 归一化键)。"""
-    return re.findall(r"[A-Za-z][A-Za-z-]*", text)
+def has_cjk(text: str) -> bool:
+    """是否含至少 2 个汉字 —— 我们自己写的提交信息已经是面向用户的中文。"""
+    return sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff") >= 2
 
 
 def localize(subject: str) -> tuple[str, bool]:
@@ -199,7 +274,13 @@ def localize(subject: str) -> tuple[str, bool]:
 
     返回 (文本, 是否纯中文)。未命中词表时返回 (原文, False)，由调用方决定
     是保留英文还是丢弃 —— 宁可输出英文原文，也不输出错译的假中文。
+
+    已经含中文的 subject（本仓库自己的提交）直接原样通过：它本身就是
+    面向用户写的，再过一遍词表只会被当成「未命中」丢掉。
     """
+    if has_cjk(subject):
+        return subject.strip(), True
+
     low = subject.lower().strip()
 
     # 1) 人工整句映射优先
@@ -281,61 +362,299 @@ def changelog_sections(repo: str, ref: str):
     import base64
     text = base64.b64decode(data["content"]).decode("utf-8", "replace")
     out = {}
-    for m in re.finditer(r"^##\s+(\d{4}-\d{2}-\d{2})\s*$\n(.*?)(?=^##\s+|\Z)",
+    for m in re.finditer(r"^##\s+(\d{4}-\d{2}-\d{2})\s*$\\n(.*?)(?=^##\s+|\Z)",
                          text, re.M | re.S):
         items = [ln.strip("- ").strip() for ln in m.group(2).splitlines() if ln.strip().startswith("-")]
         out[m.group(1)] = items
     return out
 
 
-def build_from_commits(commits):
-    """commit 列表 → [(标签, 文案)]，按中文标签分组限流。"""
+# ── 上游改动的相关性判定 ────────────────────────────────────────────
+_FILE_CACHE: dict[str, list[str]] = {}
+_MAX_FILE_LOOKUPS = 25
+
+
+def commit_files(repo: str, sha: str) -> list[str]:
+    """取单个 commit 改动的文件名列表；失败返回 []（保守当作相关）。"""
+    if sha in _FILE_CACHE:
+        return _FILE_CACHE[sha]
+    try:
+        data = api(f"https://api.github.com/repos/{repo}/commits/{sha}")
+        raw = data.get("files") if isinstance(data, dict) else None
+        files = [f["filename"] for f in (raw or [])]
+        # 超大提交（依赖锁、二进制）API 会省略 files，此时保守当作相关
+        if not files:
+            files = ["<unknown>"]
+    except Exception as exc:  # noqa: BLE001
+        print(f"  取 {sha[:7]} 改动文件失败（{type(exc).__name__}），保守当作相关",
+              file=sys.stderr)
+        files = ["<unknown>"]
+    _FILE_CACHE[sha] = files
+    return files
+
+
+def files_affect_native(files: list[str]) -> bool:
+    """
+    这批文件里是否有**原生 FPK 会用到**的。
+
+    `<unknown>` 是 API 未返回 files 的情况，保守判定为相关，宁可多报也不漏报。
+    """
+    for f in files:
+        if f == "<unknown>":
+            return True
+        if not IRRELEVANT_PATH_RE.match(f):
+            return True
+    return False
+
+
+def areas_of(files: list[str], limit: int = 3) -> str:
+    """把改动文件归纳成「涉及模块」，用于无法翻译时的兜底描述。"""
+    seen: list[str] = []
+    for f in files:
+        if f == "<unknown>":
+            continue
+        parts = f.split("/")
+        key = "/".join(parts[:2]) if len(parts) > 2 else parts[0]
+        if key not in seen:
+            seen.append(key)
+    seen = seen[:limit]
+    return "、".join(seen)
+
+
+def build_from_commits(repo: str, commits):
+    """
+    commit 列表 → (picked, stats)
+
+    stats 里记下被跳过的原因分布，供兜底文案使用：
+      irrelevant  只动了 Docker/测试/文档，原生包无影响
+      skipped     类型无意义（chore/docs/ci…）
+      dropped     有相关改动但无法翻译成干净中文
+    """
     buckets = {label: [] for label in set(TYPE_LABEL.values())}
+    stats = {"irrelevant": 0, "skipped": 0, "dropped": 0,
+             "irrelevant_files": [], "relevant_files": [],
+             "dropped_subjects": [], "relevant_total": 0}
+    lookups = 0
+
     for c in reversed(commits):  # 旧→新
         message = c["commit"]["message"]
         ctype, subject = split_conventional(message)
         if not subject:
             continue
         if ctype in SKIP_TYPES:
+            stats["skipped"] += 1
             continue
         subject = clean_subject(subject)
         if not subject:
             continue
-        # 无前缀但首字母大写（Fix xxx / Added xxx …）也算用户向
+
+        # 相关性：先花一次 API 调用看它到底动了什么
+        if lookups < _MAX_FILE_LOOKUPS:
+            files = commit_files(repo, c["sha"])
+            lookups += 1
+        else:
+            files = ["<unknown>"]
+        if not files_affect_native(files):
+            stats["irrelevant"] += 1
+            stats["irrelevant_files"].extend(files)
+            continue
+        stats["relevant_total"] += 1
+        stats["relevant_files"].extend(files)
+
         label = TYPE_LABEL.get(ctype or "")
         if label is None:
             if not subject[0].isupper():
+                stats["skipped"] += 1
                 continue
             label = "修复"
-        # 只保留能中文化的条目；词表未覆盖的英文原文直接丢弃，
-        # 避免 manifest 里出现半中半英、用户看不懂的说明。
         zh, ok = localize(subject)
         if not ok:
+            # 不再是静默丢弃：记下原文，兜底时至少告诉用户改了哪里
+            stats["dropped"] += 1
+            stats["dropped_subjects"].append((label, zh))
             continue
         buckets[label].append(zh)
+
     picked = []
     for label in ("新增", "修复", "优化"):  # 固定顺序，保证输出稳定
         for s in buckets.get(label, [])[-MAX_PER_TYPE:]:
             picked.append((label, s))
-    return picked[:MAX_TOTAL]
+    return picked[:MAX_TOTAL], stats
 
 
-def render(picked, sha) -> str:
-    if not picked:
-        return f"跟随上游更新（{sha[:7]}）。"
-    groups = {}
-    for label, s in picked:
-        groups.setdefault(label, []).append(s)
-    order = ["新增", "修复", "优化"]
+# ── 本仓库自己的打包改动 ────────────────────────────────────────────
+# 这些提交是「我们」做的，不是上游的；用户装新包时能感知的差异主要来自这里。
+_OWN_SKIP_RE = re.compile(
+    r"^(?:chore:\s*update upstream pin|Add files via upload|Merge (?:pull request|branch))",
+    re.I,
+)
+# 作用域是 ci/docs/test 的提交改的是流水线本身，装进包里的东西没变，
+# 不该出现在用户的更新说明里（实测这类提交占了打包侧改动的一半以上）。
+_PIPELINE_SCOPES = {"docs", "test", "ci", "chore", "build"}
+_OWN_SKIP_TYPE_RE = re.compile(r"^(?:docs|test|ci|chore|style|refactor)!?:", re.I)
+
+# 只在构建期起作用、装进包后没有任何区别的路径。
+# 全部改动都落在这里的提交，不进用户更新说明。
+OWN_BUILD_ONLY_RE = re.compile(
+    r"(?ix)^(?:"
+    r"\.github/.*"
+    r"|scripts/(?:prepare-deps\.sh|prune-display\.py|build-fpk\.sh|verify-fpk\.sh|package\.sh)"
+    r"|(?:[^/]+/)*docs?/.*"
+    r"|[^/]*\.md"
+    r"|changelog\.txt"
+    r"|\.gitignore"
+    r")$"
+)
+
+
+def own_changes(since_ref: str) -> list[str]:
+    """
+    取 since_ref..HEAD 之间本仓库**会影响成包内容**的提交 subject（旧→新）。
+
+    只改 `prepare-deps.sh` / `prune-display.py` / `.github/` / 文档的提交不算：
+    实测这类占了打包侧改动的 2/3（ldd 门槛、镜像回退、workflow token…），
+    但它们改的是「怎么构建」，装进包里的东西一模一样，写进用户说明只会变成
+    开发流水账。真正用户能感知的是 `patch-src.py`（改应用源码）、`manifest`、
+    `config/`、`ui/` 这类直接进包的改动。
+
+    since_ref 为空、或仓库是浅克隆（CI 默认 fetch-depth: 1）时返回空列表，
+    由调用方降级 —— 绝不能因此让整条流水线失败。
+    """
+    if not since_ref:
+        return []
+    try:
+        rng = f"{since_ref}..HEAD"
+        out = subprocess.run(
+            ["git", "log", "--no-merges", "--reverse", "--name-only",
+             "--format=@@%s", rng],
+            capture_output=True, text=True, timeout=60, check=True,
+        ).stdout
+    except Exception as exc:  # noqa: BLE001
+        print(f"  读取本仓库改动失败（{type(exc).__name__}）：浅克隆？已跳过",
+              file=sys.stderr)
+        return []
+
+    items: list[str] = []
+    subject, files = "", []
+    for line in out.splitlines() + ["@@"]:
+        if line.startswith("@@"):
+            if subject and not _is_build_only(files):
+                s = clean_subject(subject)
+                if s and not _OWN_SKIP_RE.match(s):
+                    m = re.match(r"^(\w+)\(([^)]*)\)!?:\s*(.*)$", s)
+                    if m:
+                        if (m.group(1).lower() in SKIP_TYPES
+                                or m.group(2).lower() in _PIPELINE_SCOPES):
+                            s = ""
+                        else:
+                            s = m.group(3).strip()   # 去掉 fix(scope): 前缀
+                    else:
+                        # 无作用域写法 `fix: xxx`，同样要剥前缀；
+                        # 实测这类占多数，漏掉会让用户直接看到 `perf: 精简包体…`
+                        m3 = re.match(r"^(\w+)!?:\s*(.+)$", s)
+                        if m3:
+                            if m3.group(1).lower() in SKIP_TYPES:
+                                s = ""
+                            else:
+                                s = m3.group(2).strip()
+                        elif _OWN_SKIP_TYPE_RE.match(s):
+                            s = ""
+                    if s:
+                        items.append(s)
+            subject, files = line[2:], []
+        elif line.strip():
+            files.append(line.strip())
+    return items
+
+
+def _is_build_only(files: list[str]) -> bool:
+    """全部改动文件都落在「只在构建期起作用」的路径上。"""
+    if not files:
+        return True
+    return all(OWN_BUILD_ONLY_RE.match(f) for f in files)
+
+
+def guess_own_since() -> str:
+    """自动推断上一次自动发布的位置（auto-update 的 chore 提交）。"""
+    try:
+        out = subprocess.run(
+            ["git", "log", "--format=%H", "--grep=^chore: update upstream pin", "-1"],
+            capture_output=True, text=True, timeout=30, check=True,
+        ).stdout.strip()
+        return out
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+# ── 渲染 ────────────────────────────────────────────────────────────
+def _upstream_sentence(picked, stats, sha: str) -> str:
+    """
+    上游部分的一句话概述。
+
+    优先级：能翻译的条目 > 改动模块 > 明确的「无影响」说明。
+    **任何情况下都不再输出裸的「跟随上游更新（hash）」**：那既没告诉用户
+    改了什么，也没告诉他这改动跟他装的包有没有关系。
+    """
+    if picked:
+        groups = {}
+        for label, s in picked:
+            groups.setdefault(label, []).append(s)
+        parts = []
+        for label in ("新增", "修复", "优化"):
+            if label in groups:
+                parts.append(f"{label}：{'；'.join(groups[label])}")
+        return "。".join(parts) + "。"
+
+    if stats["dropped_subjects"]:
+        # 有相关改动但翻不干净 —— 报模块，不报错译
+        areas = areas_of(stats["relevant_files"]) or "上游核心代码"
+        subj = stats["dropped_subjects"][0][1]
+        hint = f"（如 {subj[:60]}）" if subj else ""
+        return (f"上游 {len(stats['dropped_subjects'])} 处改动涉及{areas}{hint}，"
+                f"详见上游仓库。")
+
+    if stats["irrelevant"] and not stats["relevant_total"]:
+        return "上游本次仅改动 Docker 部署、测试与文档，原生包功能无变化。"
+
+    if stats["relevant_total"] == 0 and stats["skipped"]:
+        return "上游本次仅有维护类提交，功能无变化。"
+
+    return f"上游 {sha[:7]} 未带来原生包可见的功能变化。"
+
+
+def render_full(picked, stats, own, sha: str, include_upstream: bool = True) -> str:
+    """完整版：Release 正文 / FnDepot 索引用。"""
     parts = []
-    for label in order:
-        if label in groups:
-            body = "；".join(groups[label])
-            parts.append(f"{label}：{body}")
-    text = "。".join(parts) + "。"
-    if len(text) > MAX_LEN:
-        text = text[: MAX_LEN - 1].rstrip("；，。 ") + "…"
+    if include_upstream:
+        parts.append(_upstream_sentence(picked, stats, sha))
+    if own:
+        # 取最近几条（own 是旧→新），最近的改动才是这次发包里的
+        recent = own[-MAX_OWN:]
+        parts.append("打包侧：" + "；".join(recent) + "。")
+    if not parts:
+        return "本次发布未包含上游或打包侧的可见改动。"
+    text = "".join(parts)
+    if len(text) > FULL_LEN:
+        text = text[: FULL_LEN - 1].rstrip("；，。 ") + "…"
     return text
+
+
+def render_compact(full: str) -> str:
+    """
+    压缩版：manifest 单行用。
+
+    只截断，不做二次改写 —— 两处文案必须同源，否则用户在应用中心和
+    Release 页面会看到两种说法。
+    """
+    if len(full) <= MAX_LEN:
+        return full
+    cut = full[: MAX_LEN - 1]
+    # 尽量在分句处断开，避免半句
+    for sep in ("；", "。", "，"):
+        pos = cut.rfind(sep)
+        if pos > MAX_LEN // 2:
+            return cut[: pos + 1].rstrip("；，。 ") + "…"
+    return cut.rstrip("；，。 ") + "…"
 
 
 def set_manifest_changelog(manifest: Path, text: str) -> bool:
@@ -361,49 +680,69 @@ def main() -> int:
     ap.add_argument("--repo", default="halfwaystudent/douyin-sparkflow")
     ap.add_argument("--prev-sha", default="",
                     help="上一版 pin 的上游 SHA；首次更新可留空")
-    ap.add_argument("--new-sha", required=True)
+    ap.add_argument("--new-sha", default="",
+                    help="本次要构建的上游 SHA；--own-only 时可省略")
+    ap.add_argument("--own-since", default=None,
+                    help="本仓库起点 ref（默认自动推断上次自动发布点）")
+    ap.add_argument("--own-only", action="store_true",
+                    help="只输出打包侧改动，完全不调上游 API")
     ap.add_argument("--manifest", type=Path)
-    ap.add_argument("--out", type=Path, help="把 changelog 单行写到该文件")
+    ap.add_argument("--out", type=Path, help="完整版 changelog 写到该文件")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
 
-    if not re.fullmatch(r"[0-9a-f]{40}", a.new_sha):
-        ap.error("--new-sha 必须是 40 位小写 commit SHA")
+    if a.own_only and a.new_sha:
+        ap.error("--own-only 与 --new-sha 不能同时使用")
+    if not a.own_only and not re.fullmatch(r"[0-9a-f]{40}", a.new_sha):
+        ap.error("--new-sha 必须是 40 位小写 commit SHA（或用 --own-only）")
     if a.prev_sha and not re.fullmatch(r"[0-9a-f]{40}", a.prev_sha):
         ap.error("--prev-sha 必须是 40 位小写 commit SHA")
 
-    print(f"拉取 {a.repo} 区间 {(a.prev_sha[:7] or '<首次>')}..{a.new_sha[:7]} …")
-    commits = collect_commits(a.repo, a.prev_sha, a.new_sha)
-    print(f"  区间内 {len(commits)} 个提交")
-    sections = changelog_sections(a.repo, a.new_sha)
-    print(f"  上游 CHANGELOG 小节: {sorted(sections)[-3:] if sections else '无'}")
+    if a.own_only:
+        print("模式：只取打包侧改动（不查上游）")
+        commits, sections, picked = [], {}, []
+        stats = {"irrelevant": 0, "skipped": 0, "dropped": 0,
+                 "irrelevant_files": [], "relevant_files": [],
+                 "dropped_subjects": [], "relevant_total": 0}
+    else:
+        print(f"拉取 {a.repo} 区间 {(a.prev_sha[:7] or '<首次>')}..{a.new_sha[:7]} …")
+        commits = collect_commits(a.repo, a.prev_sha, a.new_sha)
+        print(f"  区间内 {len(commits)} 个提交")
+        sections = changelog_sections(a.repo, a.new_sha)
+        print(f"  上游 CHANGELOG 小节: {sorted(sections)[-3:] if sections else '无'}")
 
-    dates = sorted({c["commit"]["committer"]["date"][:10] for c in commits})
-    hit = [d for d in dates if d in sections]
-    picked = []
-    if hit:
-        # 上游手写摘要命中：它信息量最高，但原文是英文技术日志，
-        # 直接塞进 manifest 违背「面向用户」要求 —— 因此只把它作为
-        # 「本次确有上游功能更新」的证据，具体文案仍由 commit 本地化产出。
-        print(f"  命中上游 CHANGELOG 小节 {hit[-1]}（{len(sections[hit[-1]])} 条手写摘要，"
-              f"仅作校验，文案仍取 commit）")
-    if not picked:
-        picked = build_from_commits(commits)
-        dist = {l: sum(1 for x, _ in picked if x == l) for l in ("新增", "修复", "优化")}
-        print(f"  由 commit 生成 {len(picked)} 条（分布: {dist}）")
+        dates = sorted({c["commit"]["committer"]["date"][:10] for c in commits})
+        hit = [d for d in dates if d in sections]
+        if hit:
+            print(f"  命中上游 CHANGELOG 小节 {hit[-1]}（{len(sections[hit[-1]])} 条手写摘要，"
+                  f"仅作校验，文案仍取 commit）")
 
-    text = render(picked, a.new_sha)
-    print(f"\nchangelog（{len(text)} 字符）:\n  {text}")
+        picked, stats = build_from_commits(a.repo, commits)
+    print(f"  上游：相关 {stats['relevant_total']} 条 / 无关（Docker·测试·文档）"
+          f"{stats['irrelevant']} 条 / 类型跳过 {stats['skipped']} 条 / "
+          f"无法中文化 {stats['dropped']} 条 → 采信 {len(picked)} 条")
+
+    since = a.own_since if a.own_since is not None else guess_own_since()
+    own = own_changes(since)
+    print(f"  打包侧：{'起点 ' + since[:7] if since else '无起点'} → {len(own)} 条自己的改动")
+    for s in own[:8]:
+        print(f"    · {s}")
+
+    full = render_full(picked, stats, own, a.new_sha,
+                       include_upstream=not a.own_only)
+    compact = render_compact(full)
+    print(f"\n完整版（{len(full)} 字符）:\n  {full}")
+    print(f"\nmanifest 压缩版（{len(compact)} 字符）:\n  {compact}")
 
     if a.dry_run:
         print("\n[dry-run] 未写任何文件")
         return 0
     if a.out:
         a.out.parent.mkdir(parents=True, exist_ok=True)
-        a.out.write_text(text + "\n", encoding="utf-8")
+        a.out.write_text(full + "\n", encoding="utf-8")
         print(f"已写入 {a.out}")
     if a.manifest:
-        changed = set_manifest_changelog(a.manifest, text)
+        changed = set_manifest_changelog(a.manifest, compact)
         print(f"manifest changelog: {'已更新' if changed else '无变化'}")
     return 0
 
