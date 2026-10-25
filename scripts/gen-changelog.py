@@ -61,6 +61,14 @@ TYPE_LABEL = {
 # 明确丢弃的类型（不是丢整条提交，是只丢它的文案理由）
 SKIP_TYPES = {"docs", "test", "ci", "chore", "refactor", "style", "build", "merge"}
 
+# Merge 提交必须显式剔除：它没有 conventional 前缀，首字母又是大写 M，
+# 会落进「无前缀但首字母大写也算用户向」的兜底分支，被误标成「修复」。
+# 更麻烦的是 merge 提交的 files 列表为空，`commit_files` 会返回 `<unknown>`，
+# 于是被判为「相关」，最后渲染出
+#   「上游 2 处改动涉及上游核心代码（如 Merge pull request #59 from xxx-），详见上游仓库。」
+# 既没有信息量，也不该出现在应用中心。
+_MERGE_RE = re.compile(r"^merge\s+(?:pull request|branch|remote-tracking|tag)\b", re.I)
+
 # 每个前缀最多取几条，防止一次上游大版本把 changelog 撑爆
 MAX_PER_TYPE = 4
 MAX_TOTAL = 8
@@ -440,6 +448,9 @@ def build_from_commits(repo: str, commits):
         message = c["commit"]["message"]
         ctype, subject = split_conventional(message)
         if not subject:
+            continue
+        if _MERGE_RE.match(subject.strip()):
+            stats["skipped"] += 1
             continue
         if ctype in SKIP_TYPES:
             stats["skipped"] += 1
