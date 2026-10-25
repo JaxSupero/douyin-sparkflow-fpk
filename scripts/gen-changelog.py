@@ -506,10 +506,16 @@ _OWN_SKIP_TYPE_RE = re.compile(r"^(?:docs|test|ci|chore|style|refactor)!?:", re.
 
 # 只在构建期起作用、装进包后没有任何区别的路径。
 # 全部改动都落在这里的提交，不进用户更新说明。
+#
+# scripts/ 下除了 patch-src.py 全是构建期工具：prepare-deps 装依赖、
+# prune-display 裁库、build-fpk 打包、gen-changelog 生成本说明本身。
+# 它们的改动不会让用户装到的包有任何行为差异，写进应用中心只会变成
+# 开发流水账（实测 v1.1.12 的发布正文里出现了「剔除 Merge 提交…」这种话）。
+# patch-src.py 例外：它直接改上游源码后再打包，用户能感知。
 OWN_BUILD_ONLY_RE = re.compile(
     r"(?ix)^(?:"
     r"\.github/.*"
-    r"|scripts/(?:prepare-deps\.sh|prune-display\.py|build-fpk\.sh|verify-fpk\.sh|package\.sh)"
+    r"|scripts/(?!patch-src\.py$)[^/]+"
     r"|(?:[^/]+/)*docs?/.*"
     r"|[^/]*\.md"
     r"|changelog\.txt"
