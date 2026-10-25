@@ -71,18 +71,24 @@ jobs:
           set -euo pipefail
           # changelog.txt 原先只在 auto-update.yml 里生成：上游不动（我们手工
           # 发版修打包问题）时它一直是上一版的内容，manifest 里那行也同样陈旧。
-          # 这里用文件的最后提交时间判断是否落后于 manifest，落后就按本仓库
-          # 提交重新生成 —— 必须放在打包之前，manifest 的 changelog 是要进包、
-          # 由应用中心展示的那一行。
-          MANIFEST_TS="$(git log -1 --format=%ct -- manifest 2>/dev/null || echo 0)"
-          CHANGELOG_TS="$(git log -1 --format=%ct -- changelog.txt 2>/dev/null || echo 0)"
-          # 注意不能只比时间戳：文件被删除后 `git log -- changelog.txt` 仍会
-          # 返回它最后一次被修改的提交，时间戳照样很新，于是判成「已最新」而
-          # 实际根本没有这个文件。必须先确认它存在。
-          if [ -f changelog.txt ] && [ "${MANIFEST_TS:-0}" -le "${CHANGELOG_TS:-0}" ]; then
-            echo "changelog.txt 已存在且不落后于 manifest（${CHANGELOG_TS} ≥ ${MANIFEST_TS}），跳过"
+          # 这里判断 changelog.txt 是否需要按本仓库提交重建 —— 必须放在打包之前，
+          # manifest 的 changelog 是要进包、由应用中心展示的那一行。
+          #
+          # 判据用「最后改动这两个文件的提交哈希」而不是时间戳：
+          # 时间戳会被同一秒内的两次提交骗过（实测 bump manifest 与上一个
+          # changelog 提交落在同一秒时，被判成「已最新」而跳过重建）。
+          # auto-update.yml 是 manifest 与 changelog.txt 一起提交的，两者哈希
+          # 相同即为同步；不同就说明 manifest 被单独改过，需要重建。
+          MANIFEST_C="$(git log -1 --format=%H -- manifest 2>/dev/null || true)"
+          CHANGELOG_C="$(git log -1 --format=%H -- changelog.txt 2>/dev/null || true)"
+          # bash 不允许 ${var:0:7:-默认} 这种把子串和默认值混用的写法
+          # （报 bad substitution），所以先各自算好短哈希。
+          M7="${MANIFEST_C:0:7}"; M7="${M7:-无}"
+          C7="${CHANGELOG_C:0:7}"; C7="${C7:-无}"
+          if [ -f changelog.txt ] && [ -n "$MANIFEST_C" ] && [ "$MANIFEST_C" = "$CHANGELOG_C" ]; then
+            echo "changelog.txt 与 manifest 同源于 ${M7}，跳过"
           else
-            echo "changelog.txt 缺失或落后于 manifest（${CHANGELOG_TS:-无} < ${MANIFEST_TS:-无}），重新生成"
+            echo "changelog.txt 与 manifest 不同源（${C7} vs ${M7}），重新生成"
             python3 scripts/gen-changelog.py --own-only \
               --manifest manifest --out changelog.txt
           fi
