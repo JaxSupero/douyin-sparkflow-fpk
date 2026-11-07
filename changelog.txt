@@ -1,1 +1,1 @@
-上游 2 处改动涉及DouYinSparkFlow/tests、DouYinSparkFlow/webui、DouYinSparkFlow/core（如 require account edit revision in private mode），详见上游仓库。
+上游 1 处改动涉及.github/workflows、DouYinSparkFlow、DouYinSparkFlow/core（如 Unify main with Hangzhou production fixes），详见上游仓库。
