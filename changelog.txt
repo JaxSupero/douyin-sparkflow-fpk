@@ -1,1 +1,1 @@
-上游本次仅有维护类提交，功能无变化。
+上游 2 处改动涉及DouYinSparkFlow/tests、DouYinSparkFlow/webui、DouYinSparkFlow/core（如 require account edit revision in private mode），详见上游仓库。
