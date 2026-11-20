@@ -1,1 +1,1 @@
-上游 1 处改动涉及.github/workflows、DouYinSparkFlow、DouYinSparkFlow/core（如 Unify main with Hangzhou production fixes），详见上游仓库。
+上游 16 处改动涉及DouYinSparkFlow/core、DouYinSparkFlow、DouYinSparkFlow/tests（如 Merge fix/issue-63-login-state: accurate login desktop statu），详见上游仓库。
