@@ -1,1 +1,1 @@
-上游 16 处改动涉及DouYinSparkFlow/core、DouYinSparkFlow、DouYinSparkFlow/tests（如 Merge fix/issue-63-login-state: accurate login desktop statu），详见上游仓库。
+上游 1 处改动涉及DouYinSparkFlow/core、DouYinSparkFlow/docs、DouYinSparkFlow/tests（如 Sync Hangzhou production hotfixes into main），详见上游仓库。打包侧：preserve upstream browser engine options in fnOS patch。
